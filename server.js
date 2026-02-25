@@ -15,20 +15,46 @@ const MIN_PLAYERS = 2;
 const MAX_PLAYERS = 4;
 const PLAYER_TIMEOUT_MS = 5 * 60 * 1000; // 5 min max wait
 
-// Attach to an HTTP server so Render's proxy can forward WebSocket upgrades.
-// A bare WebSocketServer({ port }) listens raw TCP which Render can't reach.
-const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("DECHOOM relay OK\n");
-});
-
-const wss = new WebSocketServer({ server: httpServer });
-
 // All currently connected clients waiting or in-game
 // { ws, uid, ready, joinedAt }
 let waiting = [];
 let nextUid = 1;
 let gameStarted = false;
+
+function resetState() {
+  // Force-close any stale sockets
+  for (const p of waiting) {
+    try { p.ws.terminate(); } catch (_) {}
+  }
+  waiting = [];
+  gameStarted = false;
+  nextUid = 1;
+  log("State reset.");
+}
+
+// Attach to an HTTP server so Render's proxy can forward WebSocket upgrades.
+// A bare WebSocketServer({ port }) listens raw TCP which Render can't reach.
+const httpServer = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  if (url.pathname === "/reset" && req.method === "POST") {
+    resetState();
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("Reset OK\n");
+    return;
+  }
+
+  // Status endpoint
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    status: "DECHOOM relay OK",
+    waiting: waiting.length,
+    gameStarted,
+    nextUid,
+  }) + "\n");
+});
+
+const wss = new WebSocketServer({ server: httpServer });
 
 function allocateUid() {
   return nextUid++;
@@ -108,11 +134,12 @@ wss.on("connection", (ws, req) => {
     waiting = waiting.filter(p => p.uid !== uid);
     log(`[-] Player disconnected uid=${uid} remaining=${waiting.length}`);
 
-    // Reset game state if everyone left
-    if (waiting.length === 0) {
+    // Reset gameStarted whenever we drop below MIN_PLAYERS so the next
+    // connection isn't immediately dispatched as a late-join solo game.
+    if (waiting.length < MIN_PLAYERS) {
       gameStarted = false;
-      nextUid = 1;
-      log("All players left, resetting server");
+      if (waiting.length === 0) nextUid = 1;
+      log(`Below min players, reset gameStarted (${waiting.length} remaining)`);
     }
 
     broadcastPlayerCount();
@@ -121,9 +148,9 @@ wss.on("connection", (ws, req) => {
   ws.on("error", (err) => {
     log(`[!] Error uid=${uid}:`, err.message);
     waiting = waiting.filter(p => p.uid !== uid);
-    if (waiting.length === 0) {
+    if (waiting.length < MIN_PLAYERS) {
       gameStarted = false;
-      nextUid = 1;
+      if (waiting.length === 0) nextUid = 1;
     }
   });
 
