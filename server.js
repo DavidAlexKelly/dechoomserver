@@ -1,10 +1,21 @@
 #!/usr/bin/env node
 /**
  * DECHOOM Multiplayer Relay Server
- * 
- * Holds players in a waiting room until at least 2 are connected,
- * then sends UIDs to all waiting players simultaneously so Doom's
- * handshake window starts at the same time for everyone.
+ *
+ * Protocol (from net_websockets.c):
+ *   Every binary message is: [to: uint32LE][from: uint32LE][payload...]
+ *
+ *   - On connect: server sends the client their UID as 4 bytes (uint32LE)
+ *     Doom stores this as instanceUID and uses it as the "from" address.
+ *   - Client sends a registration packet: to=0, from=instanceUID, payload empty (8 bytes)
+ *     This tells the server "I exist, my UID is X".
+ *   - Subsequent packets: server reads bytes[0..3] as destination UID,
+ *     stamps bytes[4..7] with the real sender UID, and routes to that recipient.
+ *   - If to=0 (broadcast), relay to all other ready clients.
+ *
+ * Lobby:
+ *   Hold clients until MIN_PLAYERS connected, then send UIDs simultaneously
+ *   so Doom's handshake window opens at the same time for all players.
  */
 
 const { WebSocketServer } = require("ws");
@@ -15,25 +26,30 @@ const MIN_PLAYERS = 2;
 const MAX_PLAYERS = 4;
 const PLAYER_TIMEOUT_MS = 5 * 60 * 1000; // 5 min max wait
 
-// All currently connected clients waiting or in-game
-// { ws, uid, ready, joinedAt }
-let waiting = [];
+// clients: Map<uid, { ws, uid, ready, joinedAt }>
+let clients = new Map();
 let nextUid = 1;
 let gameStarted = false;
 
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
+}
+
+function allocateUid() {
+  return nextUid++;
+}
+
 function resetState() {
-  // Force-close any stale sockets
-  for (const p of waiting) {
+  for (const p of clients.values()) {
     try { p.ws.terminate(); } catch (_) {}
   }
-  waiting = [];
+  clients = new Map();
   gameStarted = false;
   nextUid = 1;
   log("State reset.");
 }
 
-// Attach to an HTTP server so Render's proxy can forward WebSocket upgrades.
-// A bare WebSocketServer({ port }) listens raw TCP which Render can't reach.
+// HTTP server for health checks and admin
 const httpServer = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -44,11 +60,10 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // Status endpoint
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({
     status: "DECHOOM relay OK",
-    waiting: waiting.length,
+    clients: clients.size,
     gameStarted,
     nextUid,
   }) + "\n");
@@ -56,35 +71,30 @@ const httpServer = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer });
 
-function allocateUid() {
-  return nextUid++;
-}
-
-function log(...args) {
-  console.log(new Date().toISOString(), ...args);
+function sendUid(ws, uid) {
+  // Send the UID to the client as 4-byte little-endian uint32
+  // Doom reads this as instanceUID in net_websockets.c
+  const buf = Buffer.alloc(4);
+  buf.writeUInt32LE(uid, 0);
+  ws.send(buf);
 }
 
 function broadcastPlayerCount() {
-  const msg = JSON.stringify({ type: "waiting", count: waiting.length, need: MIN_PLAYERS });
-  for (const p of waiting) {
+  const msg = JSON.stringify({ type: "waiting", count: clients.size, need: MIN_PLAYERS });
+  for (const p of clients.values()) {
     if (p.ws.readyState === 1) {
-      // Send as a text message so we can display it in the UI
-      // (Doom ignores text frames, only processes binary)
-      try { p.ws.send(msg); } catch(_) {}
+      try { p.ws.send(msg); } catch (_) {}
     }
   }
 }
 
 function startGame() {
   gameStarted = true;
-  log(`Starting game with ${waiting.length} players`);
-
+  log(`Starting game with ${clients.size} players`);
   // Send all UIDs simultaneously so all clients start their handshake together
-  for (const player of waiting) {
+  for (const player of clients.values()) {
     if (player.ws.readyState === 1) {
-      const hello = Buffer.alloc(4);
-      hello.writeUInt32LE(player.uid, 0);
-      player.ws.send(hello);
+      sendUid(player.ws, player.uid);
       player.ready = true;
       log(`Sent UID ${player.uid} to player`);
     }
@@ -94,52 +104,61 @@ function startGame() {
 wss.on("connection", (ws, req) => {
   const uid = allocateUid();
   const player = { ws, uid, ready: false, joinedAt: Date.now() };
-  waiting.push(player);
+  clients.set(uid, player);
 
   const addr = req.socket.remoteAddress;
-  log(`[+] Player connected uid=${uid} addr=${addr} waiting=${waiting.length}`);
+  log(`[+] Player connected uid=${uid} addr=${addr} total=${clients.size}`);
 
   broadcastPlayerCount();
 
-  // If we have enough players, start immediately
-  if (waiting.length >= MIN_PLAYERS && !gameStarted) {
+  // If we already have enough players, start immediately
+  if (clients.size >= MIN_PLAYERS && !gameStarted) {
     startGame();
   }
 
-  // If game already started and a new player joins mid-session, send their UID immediately
+  // Late join: game already in progress, give them their UID right away
   if (gameStarted && !player.ready) {
-    const hello = Buffer.alloc(4);
-    hello.writeUInt32LE(uid, 0);
-    ws.send(hello);
+    sendUid(ws, uid);
     player.ready = true;
     log(`Late join uid=${uid}`);
   }
 
   ws.on("message", (data) => {
     if (!(data instanceof Buffer)) data = Buffer.from(data);
+
+    // Must be at least 8 bytes (to + from header)
     if (data.length < 8) return;
+
+    // Read destination UID from bytes [0..3]
+    const toUid = data.readUInt32LE(0);
 
     // Stamp the real sender UID into bytes [4..7]
     data.writeUInt32LE(uid, 4);
 
-    // Relay to all other ready players
-    for (const other of waiting) {
-      if (other.uid !== uid && other.ready && other.ws.readyState === 1) {
-        try { other.ws.send(data); } catch(_) {}
+    if (toUid === 0) {
+      // Broadcast to all other ready clients
+      for (const other of clients.values()) {
+        if (other.uid !== uid && other.ready && other.ws.readyState === 1) {
+          try { other.ws.send(data); } catch (_) {}
+        }
+      }
+    } else {
+      // Unicast to specific client
+      const target = clients.get(toUid);
+      if (target && target.ready && target.ws.readyState === 1) {
+        try { target.ws.send(data); } catch (_) {}
       }
     }
   });
 
   ws.on("close", () => {
-    waiting = waiting.filter(p => p.uid !== uid);
-    log(`[-] Player disconnected uid=${uid} remaining=${waiting.length}`);
+    clients.delete(uid);
+    log(`[-] Player disconnected uid=${uid} remaining=${clients.size}`);
 
-    // Reset gameStarted whenever we drop below MIN_PLAYERS so the next
-    // connection isn't immediately dispatched as a late-join solo game.
-    if (waiting.length < MIN_PLAYERS) {
+    if (clients.size < MIN_PLAYERS) {
       gameStarted = false;
-      if (waiting.length === 0) nextUid = 1;
-      log(`Below min players, reset gameStarted (${waiting.length} remaining)`);
+      if (clients.size === 0) nextUid = 1;
+      log(`Below min players, reset gameStarted (${clients.size} remaining)`);
     }
 
     broadcastPlayerCount();
@@ -147,21 +166,18 @@ wss.on("connection", (ws, req) => {
 
   ws.on("error", (err) => {
     log(`[!] Error uid=${uid}:`, err.message);
-    waiting = waiting.filter(p => p.uid !== uid);
-    if (waiting.length < MIN_PLAYERS) {
+    clients.delete(uid);
+    if (clients.size < MIN_PLAYERS) {
       gameStarted = false;
-      if (waiting.length === 0) nextUid = 1;
+      if (clients.size === 0) nextUid = 1;
     }
   });
 
-  // Timeout player if they wait too long alone
+  // Timeout: if still waiting alone after PLAYER_TIMEOUT_MS, send UID anyway
   setTimeout(() => {
-    if (!player.ready && player.ws.readyState === 1) {
-      log(`Timeout waiting for players, starting solo uid=${uid}`);
-      // Send UID anyway so Doom doesn't hang forever
-      const hello = Buffer.alloc(4);
-      hello.writeUInt32LE(uid, 0);
-      ws.send(hello);
+    if (!player.ready && ws.readyState === 1) {
+      log(`Timeout uid=${uid}, starting solo`);
+      sendUid(ws, uid);
       player.ready = true;
       gameStarted = true;
     }
@@ -170,7 +186,6 @@ wss.on("connection", (ws, req) => {
 
 httpServer.listen(PORT, () => {
   log(`DECHOOM relay listening on http://0.0.0.0:${PORT}`);
-  log(`WebSocket upgrade available at ws://0.0.0.0:${PORT}`);
   log(`Waiting for ${MIN_PLAYERS} players before starting`);
 });
 
