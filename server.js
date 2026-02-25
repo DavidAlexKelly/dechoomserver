@@ -2,19 +2,24 @@
 /**
  * DECHOOM Multiplayer Relay Server
  *
- * Protocol (from net_websockets.c / d_loop.c):
+ * Protocol (net_websockets.c / d_loop.c):
  *
- * LOBBY PHASE (text frames):
+ * LOBBY PHASE (JS WebSocket, text frames):
  *   Server → Client: { type: "waiting", count: N, need: M }
  *   Server → Client: { type: "start", role: "server"|"client" }
- *     - First player gets role "server" (Doom -server flag)
- *     - All others get role "client" (Doom -connect 1 flag)
  *
- * GAME PHASE (binary frames, 8-byte header):
+ * GAME PHASE (Doom WebSocket, binary frames):
  *   [to: uint32LE][from: uint32LE][payload...]
- *   - to=0 means broadcast to all other players
- *   - to=N means unicast to player with uid=N
- *   Server stamps bytes[4..7] with real sender uid before forwarding.
+ *
+ * KEY INSIGHT:
+ *   The client always does -connect 1, which resolves to "server uid = 1".
+ *   But Doom generates instanceUID randomly from srand(time()) — it won't be 1.
+ *   So the relay must translate:
+ *     - Packets FROM the server → rewrite from field to 1 before forwarding to clients
+ *     - Packets TO uid=1 from clients → route to whoever the server connection is
+ *
+ *   On first connect the server sends an 8-byte registration packet (to=0, from=serverUID).
+ *   The relay captures serverUID from this, then uses 1 as the server's "public" uid.
  */
 
 const { WebSocketServer } = require("ws");
@@ -24,25 +29,30 @@ const PORT = process.env.PORT || 2342;
 const MIN_PLAYERS = 2;
 const PLAYER_TIMEOUT_MS = 5 * 60 * 1000;
 
-let clients = new Map();
-let nextUid = 1;
+// Lobby state
+let lobbyClients = new Map(); // uid -> { ws, uid, role, ready }
+let nextLobbyUid = 1;
 let gameStarted = false;
+
+// Game state - track server and clients separately
+let serverConn = null;      // the Doom WebSocket of the server player
+let serverDoomUid = null;   // the server's actual Doom instanceUID (from registration packet)
+let gameConns = new Map();  // doomUid -> ws (for all game connections including server)
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
 }
 
-function allocateUid() {
-  return nextUid++;
-}
-
 function resetState() {
-  for (const p of clients.values()) {
+  for (const p of lobbyClients.values()) {
     try { p.ws.terminate(); } catch (_) {}
   }
-  clients = new Map();
+  lobbyClients = new Map();
   gameStarted = false;
-  nextUid = 1;
+  nextLobbyUid = 1;
+  serverConn = null;
+  serverDoomUid = null;
+  gameConns = new Map();
   log("State reset.");
 }
 
@@ -55,7 +65,13 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "DECHOOM relay OK", clients: clients.size, gameStarted, nextUid }) + "\n");
+  res.end(JSON.stringify({
+    status: "DECHOOM relay OK",
+    lobbyClients: lobbyClients.size,
+    gameStarted,
+    serverDoomUid,
+    gameConns: gameConns.size,
+  }) + "\n");
 });
 
 const wss = new WebSocketServer({ server: httpServer });
@@ -65,99 +81,195 @@ function sendText(ws, obj) {
 }
 
 function broadcastWaiting() {
-  const msg = { type: "waiting", count: clients.size, need: MIN_PLAYERS };
-  for (const p of clients.values()) {
+  const msg = { type: "waiting", count: lobbyClients.size, need: MIN_PLAYERS };
+  for (const p of lobbyClients.values()) {
     if (p.ws.readyState === 1) sendText(p.ws, msg);
   }
 }
 
-function startGame() {
+function startLobby() {
   gameStarted = true;
-  log(`Starting game with ${clients.size} players`);
+  log(`Starting lobby with ${lobbyClients.size} players`);
   let position = 1;
-  for (const player of clients.values()) {
+  for (const player of lobbyClients.values()) {
     if (player.ws.readyState === 1) {
       const role = position === 1 ? "server" : "client";
       player.role = role;
       player.ready = true;
       sendText(player.ws, { type: "start", role });
-      log(`Sent role=${role} to uid=${player.uid}`);
+      log(`Sent role=${role} to lobby uid=${player.uid}`);
     }
     position++;
   }
 }
 
 wss.on("connection", (ws, req) => {
-  const uid = allocateUid();
-  const player = { ws, uid, role: null, ready: false, joinedAt: Date.now() };
-  clients.set(uid, player);
-  log(`[+] Player connected uid=${uid} addr=${req.socket.remoteAddress} total=${clients.size}`);
+  // Determine if this is a lobby connection (text) or game connection (binary)
+  // We track state on the socket itself
+  ws.isGame = false;
+  ws.doomUid = null;
+  ws.isServer = false;
 
-  broadcastWaiting();
+  const addr = req.socket.remoteAddress;
 
-  if (clients.size >= MIN_PLAYERS && !gameStarted) {
-    startGame();
-  }
+  // First message determines type:
+  // - Text JSON = lobby connection
+  // - Binary 8+ bytes = game connection (Doom opened -wss)
 
-  if (gameStarted && !player.ready) {
-    player.role = "client";
-    player.ready = true;
-    sendText(ws, { type: "start", role: "client" });
-    log(`Late join uid=${uid} as client`);
-  }
+  let lobbyUid = null;
 
-  ws.on("message", (data) => {
-    if (typeof data === "string") return;
-    if (!(data instanceof Buffer)) data = Buffer.from(data);
-    if (data.length < 8) return;
+  const onFirstMessage = (data) => {
+    ws.removeListener("message", onFirstMessage);
 
-    const toUid = data.readUInt32LE(0);
-    data.writeUInt32LE(uid, 4);
+    if (typeof data === "string" || (data instanceof Buffer && data.length < 8)) {
+      // Lobby connection
+      ws.isGame = false;
+      lobbyUid = nextLobbyUid++;
+      const player = { ws, uid: lobbyUid, role: null, ready: false };
+      lobbyClients.set(lobbyUid, player);
+      log(`[+] Lobby connection uid=${lobbyUid} addr=${addr} total=${lobbyClients.size}`);
 
-    if (toUid === 0) {
-      for (const other of clients.values()) {
-        if (other.uid !== uid && other.ready && other.ws.readyState === 1) {
-          try { other.ws.send(data); } catch (_) {}
-        }
+      broadcastWaiting();
+
+      if (lobbyClients.size >= MIN_PLAYERS && !gameStarted) {
+        startLobby();
       }
+      if (gameStarted && !player.ready) {
+        player.role = "client";
+        player.ready = true;
+        sendText(ws, { type: "start", role: "client" });
+        log(`Late join uid=${lobbyUid} as client`);
+      }
+
+      ws.on("message", (msg) => {
+        if (typeof msg === "string") return; // ignore further text
+      });
+
     } else {
-      const target = clients.get(toUid);
-      if (target && target.ready && target.ws.readyState === 1) {
-        try { target.ws.send(data); } catch (_) {}
+      // Game connection from Doom (-wss opened)
+      ws.isGame = true;
+      if (!(data instanceof Buffer)) data = Buffer.from(data);
+
+      // Registration packet: to=0, from=instanceUID, no payload (exactly 8 bytes)
+      // or normal packet with payload
+      const toUid = data.readUInt32LE(0);
+      const fromUid = data.readUInt32LE(4);
+
+      // First binary connection with to=0 is the server registering
+      if (serverConn === null) {
+        serverConn = ws;
+        serverDoomUid = fromUid;
+        ws.isServer = true;
+        ws.doomUid = fromUid;
+        gameConns.set(fromUid, ws);
+        log(`[+] Server game connection doomUid=${fromUid}`);
+
+        // Forward the registration broadcast to all other game connections
+        // (rewriting from=serverDoomUid to from=1 so clients think server is uid=1)
+        const rewritten = Buffer.from(data);
+        rewritten.writeUInt32LE(1, 4); // server always appears as uid=1 to clients
+        for (const [uid, conn] of gameConns) {
+          if (conn !== ws && conn.readyState === 1) {
+            try { conn.send(rewritten); } catch (_) {}
+          }
+        }
+      } else {
+        // Client game connection
+        ws.doomUid = fromUid;
+        ws.isServer = false;
+        gameConns.set(fromUid, ws);
+        log(`[+] Client game connection doomUid=${fromUid}`);
+
+        // Process this first packet normally
+        routeGamePacket(ws, data);
       }
+
+      // Handle subsequent game packets
+      ws.on("message", (msg) => {
+        if (typeof msg === "string") return;
+        if (!(msg instanceof Buffer)) msg = Buffer.from(msg);
+        if (msg.length < 8) return;
+        routeGamePacket(ws, msg);
+      });
     }
-  });
+  };
+
+  ws.on("message", onFirstMessage);
 
   ws.on("close", () => {
-    clients.delete(uid);
-    log(`[-] Player disconnected uid=${uid} remaining=${clients.size}`);
-    if (clients.size < MIN_PLAYERS) {
-      gameStarted = false;
-      if (clients.size === 0) nextUid = 1;
-      log(`Below min players, reset gameStarted (${clients.size} remaining)`);
+    if (!ws.isGame) {
+      if (lobbyUid) {
+        lobbyClients.delete(lobbyUid);
+        log(`[-] Lobby disconnected uid=${lobbyUid} remaining=${lobbyClients.size}`);
+        if (lobbyClients.size < MIN_PLAYERS) {
+          gameStarted = false;
+          if (lobbyClients.size === 0) nextLobbyUid = 1;
+        }
+        broadcastWaiting();
+      }
+    } else {
+      if (ws.doomUid !== null) gameConns.delete(ws.doomUid);
+      if (ws.isServer) {
+        serverConn = null;
+        serverDoomUid = null;
+        log(`[-] Server game disconnected`);
+      } else {
+        log(`[-] Client game disconnected doomUid=${ws.doomUid}`);
+      }
     }
-    broadcastWaiting();
   });
 
   ws.on("error", (err) => {
-    log(`[!] Error uid=${uid}:`, err.message);
-    clients.delete(uid);
-    if (clients.size < MIN_PLAYERS) {
-      gameStarted = false;
-      if (clients.size === 0) nextUid = 1;
-    }
+    log(`[!] Error:`, err.message);
   });
 
+  // Lobby timeout
   setTimeout(() => {
-    if (!player.ready && ws.readyState === 1) {
-      log(`Timeout uid=${uid}, starting solo as server`);
-      player.role = "server";
-      player.ready = true;
-      gameStarted = true;
-      sendText(ws, { type: "start", role: "server" });
+    if (!ws.isGame && lobbyUid) {
+      const player = lobbyClients.get(lobbyUid);
+      if (player && !player.ready && ws.readyState === 1) {
+        log(`Timeout lobby uid=${lobbyUid}, starting solo`);
+        player.ready = true;
+        gameStarted = true;
+        sendText(ws, { type: "start", role: "server" });
+      }
     }
   }, PLAYER_TIMEOUT_MS);
 });
+
+function routeGamePacket(ws, data) {
+  const toUid = data.readUInt32LE(0);
+  const fromUid = data.readUInt32LE(4);
+
+  // Rewrite from field:
+  // - If from server: always appear as uid=1 to clients
+  // - If from client: use their actual doomUid
+  const rewritten = Buffer.from(data);
+  if (ws.isServer) {
+    rewritten.writeUInt32LE(1, 4);
+  }
+  // else keep fromUid as-is
+
+  if (toUid === 0) {
+    // Broadcast to all other game connections
+    for (const [, conn] of gameConns) {
+      if (conn !== ws && conn.readyState === 1) {
+        try { conn.send(rewritten); } catch (_) {}
+      }
+    }
+  } else if (toUid === 1) {
+    // Client addressing the server — route to serverConn
+    if (serverConn && serverConn.readyState === 1) {
+      try { serverConn.send(data); } catch (_) {} // send original, don't rewrite
+    }
+  } else {
+    // Unicast to specific doomUid
+    const target = gameConns.get(toUid);
+    if (target && target.readyState === 1) {
+      try { target.send(rewritten); } catch (_) {}
+    }
+  }
+}
 
 httpServer.listen(PORT, () => {
   log(`DECHOOM relay listening on http://0.0.0.0:${PORT}`);
