@@ -8,13 +8,21 @@
  */
 
 const { WebSocketServer } = require("ws");
+const http = require("http");
 
 const PORT = process.env.PORT || 2342;
 const MIN_PLAYERS = 2;
 const MAX_PLAYERS = 4;
 const PLAYER_TIMEOUT_MS = 5 * 60 * 1000; // 5 min max wait
 
-const wss = new WebSocketServer({ port: PORT });
+// Attach to an HTTP server so Render's proxy can forward WebSocket upgrades.
+// A bare WebSocketServer({ port }) listens raw TCP which Render can't reach.
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("DECHOOM relay OK\n");
+});
+
+const wss = new WebSocketServer({ server: httpServer });
 
 // All currently connected clients waiting or in-game
 // { ws, uid, ready, joinedAt }
@@ -133,8 +141,9 @@ wss.on("connection", (ws, req) => {
   }, PLAYER_TIMEOUT_MS);
 });
 
-wss.on("listening", () => {
-  log(`DECHOOM relay listening on ws://0.0.0.0:${PORT}`);
+httpServer.listen(PORT, () => {
+  log(`DECHOOM relay listening on http://0.0.0.0:${PORT}`);
+  log(`WebSocket upgrade available at ws://0.0.0.0:${PORT}`);
   log(`Waiting for ${MIN_PLAYERS} players before starting`);
 });
 
