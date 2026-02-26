@@ -70,7 +70,8 @@ const wss = new WebSocketServer({ server: httpServer });
 function sendText(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch (_) {} }
 
 function broadcastWaiting() {
-  const msg = { type: "waiting", count: lobbyClients.size, need: MIN_PLAYERS };
+  const players = Array.from(lobbyClients.values()).map(p => p.username ?? "Operator");
+  const msg = { type: "waiting", count: lobbyClients.size, need: MIN_PLAYERS, players };
   for (const p of lobbyClients.values()) {
     if (p.ws.readyState === 1) sendText(p.ws, msg);
   }
@@ -143,7 +144,15 @@ wss.on("connection", (ws, req) => {
       sendText(ws, { type: "start", role: "client" });
     }
 
-    ws.on("message", () => {}); // ignore any messages from lobby clients
+    ws.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "lobby" && msg.username) {
+          player.username = msg.username;
+          broadcastWaiting(); // re-broadcast with updated name
+        }
+      } catch (_) {}
+    });
     ws.on("close", () => {
       lobbyClients.delete(uid);
       log(`[-] Lobby uid=${uid} remaining=${lobbyClients.size}`);
