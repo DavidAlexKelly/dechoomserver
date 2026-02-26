@@ -84,7 +84,7 @@ function startLobby() {
     if (p.ws.readyState === 1) {
       const role = pos === 1 ? "server" : "client";
       p.role = role; p.ready = true;
-      sendText(p.ws, { type: "start", role });
+      sendText(p.ws, { type: "start", role, playerCount: lobbyClients.size });
       log(`role=${role} → lobby uid=${p.uid}`);
       if (role === "server") {
         serverLobbyWs = p.ws; // hold open - send "go" when client game connects
