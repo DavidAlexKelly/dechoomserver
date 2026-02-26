@@ -29,6 +29,7 @@ let gameStarted = false;
 let serverConn = null;
 let serverDoomUid = null;
 let gameConns = new Map();
+let pendingClientPackets = []; // packets from clients that arrived before server
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -43,6 +44,7 @@ function resetState() {
   serverConn = null;
   serverDoomUid = null;
   gameConns = new Map();
+  pendingClientPackets = [];
   log("State reset.");
 }
 
@@ -89,18 +91,25 @@ function startLobby() {
 
 function routeGamePacket(ws, data) {
   const toUid = data.readUInt32LE(0);
-  const rewritten = Buffer.from(data);
-  if (ws.isServer) rewritten.writeUInt32LE(1, 4);
 
   if (toUid === 0) {
+    // Broadcast to all other game connections
     for (const c of gameConns.values()) {
-      if (c !== ws && c.readyState === 1) { try { c.send(rewritten); } catch (_) {} }
+      if (c !== ws && c.readyState === 1) { try { c.send(data); } catch (_) {} }
     }
   } else if (toUid === 1) {
-    if (serverConn && serverConn.readyState === 1) { try { serverConn.send(data); } catch (_) {} }
+    // Client → server
+    if (serverConn && serverConn.readyState === 1) {
+      try { serverConn.send(data); } catch (_) {}
+    } else {
+      // Server not yet connected - buffer the packet
+      pendingClientPackets.push(Buffer.from(data));
+      log(`Buffered client packet (server not yet connected), total=${pendingClientPackets.length}`);
+    }
   } else {
+    // Unicast to specific UID
     const t = gameConns.get(toUid);
-    if (t && t.readyState === 1) { try { t.send(rewritten); } catch (_) {} }
+    if (t && t.readyState === 1) { try { t.send(data); } catch (_) {} }
   }
 }
 
@@ -158,21 +167,32 @@ wss.on("connection", (ws, req) => {
       const toUid = data.readUInt32LE(0);
       ws.doomUid = fromUid;
 
-      if (serverConn === null) {
+      // Identify server by instanceUID=1 (hardcoded in d_loop.c for -server)
+      // Any other UID is a client running -connect
+      const isServerConn = (fromUid === 1);
+
+      ws.isServer = isServerConn;
+      gameConns.set(fromUid, ws);
+
+      if (isServerConn) {
         serverConn = ws;
-        serverDoomUid = fromUid;
-        ws.isServer = true;
-        gameConns.set(fromUid, ws);
+        serverDoomUid = 1;
         log(`[+] Server game doomUid=${fromUid} addr=${addr}`);
+        // Forward server's broadcast registration to any already-connected clients
         if (toUid === 0) {
-          const r = Buffer.from(data); r.writeUInt32LE(1, 4);
           for (const c of gameConns.values()) {
-            if (c !== ws && c.readyState === 1) { try { c.send(r); } catch (_) {} }
+            if (c !== ws && c.readyState === 1) { try { c.send(data); } catch (_) {} }
           }
         }
+        // Also forward any buffered packets from clients that arrived before the server
+        if (pendingClientPackets.length > 0) {
+          log(`Flushing ${pendingClientPackets.length} buffered client packet(s) to server`);
+          for (const pkt of pendingClientPackets) {
+            try { serverConn.send(pkt); } catch (_) {}
+          }
+          pendingClientPackets.length = 0;
+        }
       } else {
-        ws.isServer = false;
-        gameConns.set(fromUid, ws);
         log(`[+] Client game doomUid=${fromUid} addr=${addr}`);
         routeGamePacket(ws, data);
       }
