@@ -150,6 +150,19 @@ wss.on("connection", (ws, req) => {
         if (msg.type === "lobby" && msg.username) {
           player.username = msg.username;
           broadcastWaiting(); // re-broadcast with updated name
+        } else if (msg.type === "kill_event") {
+          // Broadcast named kill to all lobby clients
+          const killMsg = JSON.stringify({
+            type: "kill_event",
+            killer: msg.killer,
+            victim: msg.victim,
+          });
+          log(`kill_event: ${msg.killer} eliminated ${msg.victim}`);
+          for (const p of lobbyClients.values()) {
+            if (p.ws.readyState === 1) {
+              try { p.ws.send(killMsg); } catch (_) {}
+            }
+          }
         }
       } catch (_) {}
     });
