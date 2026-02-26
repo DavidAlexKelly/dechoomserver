@@ -98,6 +98,10 @@ function startLobby() {
 function routeGamePacket(ws, data) {
   const toUid = data.readUInt32LE(0);
 
+  const fromUid2 = data.readUInt32LE(4);
+  const label = toUid === 0 ? "broadcast" : `uid${fromUid2}→uid${toUid}`;
+  log(`pkt ${label} len=${data.length} serverReady=${!!serverConn}`);
+
   if (toUid === 0) {
     // Broadcast to all other game connections
     for (const c of gameConns.values()) {
@@ -107,12 +111,14 @@ function routeGamePacket(ws, data) {
     // Client → server
     if (serverConn && serverConn.readyState === 1) {
       try { serverConn.send(data); } catch (_) {}
+    } else {
+      log(`DROP pkt to server (not connected)`);
     }
-    // If server not yet connected, drop - client will retry SYNs naturally
   } else {
     // Unicast to specific UID
     const t = gameConns.get(toUid);
     if (t && t.readyState === 1) { try { t.send(data); } catch (_) {} }
+    else log(`DROP pkt to uid=${toUid} (not found)`);
   }
 }
 
@@ -192,10 +198,16 @@ wss.on("connection", (ws, req) => {
         log(`[+] Client game doomUid=${fromUid} addr=${addr}`);
         routeGamePacket(ws, data);
         // Signal server lobby to launch Doom now that client is connected
-        if (serverLobbyWs && serverLobbyWs.readyState === 1) {
-          log(`Sending go signal to server lobby`);
-          sendText(serverLobbyWs, { type: "go" });
+        // Small delay to allow server Doom to fully init before client sends SYNs
+        if (serverLobbyWs) {
+          const savedLobbyWs = serverLobbyWs;
           serverLobbyWs = null;
+          setTimeout(() => {
+            if (savedLobbyWs.readyState === 1) {
+              log(`Sending go signal to server lobby`);
+              sendText(savedLobbyWs, { type: "go" });
+            }
+          }, 500);
         }
       }
 
