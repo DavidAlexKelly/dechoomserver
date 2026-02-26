@@ -29,7 +29,8 @@ let gameStarted = false;
 let serverConn = null;
 let serverDoomUid = null;
 let gameConns = new Map();
-let pendingClientPackets = []; // packets from clients that arrived before server
+let pendingClientPackets = [];
+let serverLobbyWs = null; // server's lobby WS, kept open until client game connects // packets from clients that arrived before server
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -45,6 +46,7 @@ function resetState() {
   serverDoomUid = null;
   gameConns = new Map();
   pendingClientPackets = [];
+  serverLobbyWs = null;
   log("State reset.");
 }
 
@@ -195,6 +197,12 @@ wss.on("connection", (ws, req) => {
       } else {
         log(`[+] Client game doomUid=${fromUid} addr=${addr}`);
         routeGamePacket(ws, data);
+        // Client game connected - signal server lobby to launch Doom
+        if (serverLobbyWs && serverLobbyWs.readyState === 1) {
+          log(`Sending go signal to server lobby`);
+          sendText(serverLobbyWs, { type: "go" });
+          serverLobbyWs = null;
+        }
       }
 
       ws.on("message", (msg) => {
