@@ -86,6 +86,10 @@ function startLobby() {
       p.role = role; p.ready = true;
       sendText(p.ws, { type: "start", role });
       log(`role=${role} → lobby uid=${p.uid}`);
+      if (role === "server") {
+        serverLobbyWs = p.ws; // hold open - send "go" when client game connects
+        log(`Holding server lobby ws open for go signal`);
+      }
     }
     pos++;
   }
@@ -103,11 +107,8 @@ function routeGamePacket(ws, data) {
     // Client → server
     if (serverConn && serverConn.readyState === 1) {
       try { serverConn.send(data); } catch (_) {}
-    } else {
-      // Server not yet connected - buffer the packet
-      pendingClientPackets.push(Buffer.from(data));
-      log(`Buffered client packet (server not yet connected), total=${pendingClientPackets.length}`);
     }
+    // If server not yet connected, drop - client will retry SYNs naturally
   } else {
     // Unicast to specific UID
     const t = gameConns.get(toUid);
@@ -186,18 +187,11 @@ wss.on("connection", (ws, req) => {
             if (c !== ws && c.readyState === 1) { try { c.send(data); } catch (_) {} }
           }
         }
-        // Also forward any buffered packets from clients that arrived before the server
-        if (pendingClientPackets.length > 0) {
-          log(`Flushing ${pendingClientPackets.length} buffered client packet(s) to server`);
-          for (const pkt of pendingClientPackets) {
-            try { serverConn.send(pkt); } catch (_) {}
-          }
-          pendingClientPackets.length = 0;
-        }
+
       } else {
         log(`[+] Client game doomUid=${fromUid} addr=${addr}`);
         routeGamePacket(ws, data);
-        // Client game connected - signal server lobby to launch Doom
+        // Signal server lobby to launch Doom now that client is connected
         if (serverLobbyWs && serverLobbyWs.readyState === 1) {
           log(`Sending go signal to server lobby`);
           sendText(serverLobbyWs, { type: "go" });
