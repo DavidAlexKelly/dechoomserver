@@ -71,8 +71,17 @@ function sendText(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch (_) {} 
 
 function broadcastWaiting() {
   const players = Array.from(lobbyClients.values()).map(p => p.username ?? "Operator");
-  const msg = { type: "waiting", count: lobbyClients.size, need: MIN_PLAYERS, players };
+  // First client in the map is always the host
+  const hostUid = lobbyClients.size > 0 ? lobbyClients.keys().next().value : null;
   for (const p of lobbyClients.values()) {
+    const msg = {
+      type: "waiting",
+      count: lobbyClients.size,
+      need: MIN_PLAYERS,
+      players,
+      isHost: p.uid === hostUid,
+      canStart: lobbyClients.size >= MIN_PLAYERS,
+    };
     if (p.ws.readyState === 1) sendText(p.ws, msg);
   }
 }
@@ -138,8 +147,7 @@ wss.on("connection", (ws, req) => {
     log(`[+] Lobby uid=${uid} total=${lobbyClients.size}`);
 
     broadcastWaiting();
-    if (lobbyClients.size >= MIN_PLAYERS && !gameStarted) startLobby();
-    else if (gameStarted && !player.ready) {
+    if (gameStarted && !player.ready) {
       player.role = "client"; player.ready = true;
       sendText(ws, { type: "start", role: "client" });
     }
@@ -150,6 +158,13 @@ wss.on("connection", (ws, req) => {
         if (msg.type === "lobby" && msg.username) {
           player.username = msg.username;
           broadcastWaiting(); // re-broadcast with updated name
+        } else if (msg.type === "start_game") {
+          // Only the host (first connected) can start
+          const hostUid = lobbyClients.keys().next().value;
+          if (player.uid === hostUid && lobbyClients.size >= MIN_PLAYERS && !gameStarted) {
+            log(`Host uid=${player.uid} started the game`);
+            startLobby();
+          }
         } else if (msg.type === "kill_event") {
           // Broadcast named kill to all lobby clients
           const killMsg = JSON.stringify({
