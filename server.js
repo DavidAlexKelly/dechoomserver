@@ -246,12 +246,26 @@ wss.on("connection", (ws, req) => {
     ws.on("close", () => {
       lobbyClients.delete(uid);
       log(`[-] Lobby uid=${uid} remaining=${lobbyClients.size}`);
-      if (lobbyClients.size < MIN_PLAYERS) {
+
+      // If the game hadn't fully launched yet, reset state so remaining
+      // players can form a new lobby rather than being stuck in a stale start.
+      if (gameStarted) {
+        log(`Player left mid-start — aborting launch, resetting to lobby`);
         gameStarted = false;
         expectedGameClients = 0;
         connectedGameClients = 0;
-        if (lobbyClients.size === 0) nextLobbyUid = 1;
+        serverLobbyWs = null;
+        // Tell all remaining lobby clients to reset back to waiting state
+        for (const p of lobbyClients.values()) {
+          if (p.ws.readyState === 1) {
+            p.role = null;
+            p.ready = false;
+            sendText(p.ws, { type: "lobby_reset", reason: "A player left before the session started" });
+          }
+        }
       }
+
+      if (lobbyClients.size === 0) nextLobbyUid = 1;
       broadcastWaiting();
     });
 
