@@ -49,6 +49,7 @@ const connMeta = new WeakMap();
 let expectedGameClients = 0;
 let connectedGameClients = 0;
 let serverLobbyWs = null;
+let clientLobbyWsList = []; // client lobby WSes waiting for client_go
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -64,6 +65,7 @@ function resetState() {
   serverDoomUid = null;
   gameConns = new Map();
   serverLobbyWs = null;
+  clientLobbyWsList = [];
   expectedGameClients = 0;
   connectedGameClients = 0;
   selectedMap = 1;
@@ -116,7 +118,7 @@ function startLobby() {
 
   expectedGameClients = totalPlayers - 1;
   connectedGameClients = 0;
-  log(`Waiting for ${expectedGameClients} Doom game client(s) to connect before sending go`);
+  log(`Game starting: ${totalPlayers} players, map ${selectedMap}`);
 
   let pos = 1;
   for (const p of lobbyClients.values()) {
@@ -127,11 +129,15 @@ function startLobby() {
       log(`role=${role} → lobby uid=${p.uid}`);
       if (role === "server") {
         serverLobbyWs = p.ws;
-        log(`Holding server lobby ws open until all ${expectedGameClients} client(s) connect`);
+      } else {
+        clientLobbyWsList.push(p.ws);
       }
     }
     pos++;
   }
+
+  // Fire go signals: server immediately, clients after SERVER_BOOT_MS
+  sendGoSignals();
 }
 
 // Return a copy of data with the from field (bytes 4-7) rewritten.
@@ -171,23 +177,24 @@ function routeGamePacket(senderWs, data) {
   }
 }
 
-function maybeGoSignal() {
-  log(`maybeGoSignal: ${connectedGameClients}/${expectedGameClients} clients connected`);
-  if (!serverLobbyWs) return;
-  if (expectedGameClients < 1) return;
-  if (connectedGameClients < expectedGameClients) return;
+const SERVER_BOOT_MS = 4000; // ms to wait after server boots before clients connect
 
-  const savedLobbyWs = serverLobbyWs;
-  serverLobbyWs = null;
+function sendGoSignals() {
+  // 1. Tell server player to launch Doom immediately
+  if (serverLobbyWs && serverLobbyWs.readyState === 1) {
+    log(`Sending go to server player`);
+    sendText(serverLobbyWs, { type: "go" });
+    serverLobbyWs = null;
+  }
 
+  // 2. After SERVER_BOOT_MS, tell all client players to launch
   setTimeout(() => {
-    if (savedLobbyWs.readyState === 1) {
-      log(`All ${connectedGameClients} client(s) connected — sending go to server`);
-      sendText(savedLobbyWs, { type: "go" });
-    } else {
-      log(`Server lobby WS closed before go could be sent`);
+    log(`Sending client_go to ${clientLobbyWsList.length} client(s)`);
+    for (const cws of clientLobbyWsList) {
+      if (cws.readyState === 1) sendText(cws, { type: "client_go" });
     }
-  }, 500);
+    clientLobbyWsList = [];
+  }, SERVER_BOOT_MS);
 }
 
 wss.on("connection", (ws, req) => {
@@ -269,6 +276,7 @@ wss.on("connection", (ws, req) => {
         expectedGameClients = 0;
         connectedGameClients = 0;
         serverLobbyWs = null;
+        clientLobbyWsList = [];
         selectedMap = 1;
         // Tell all remaining lobby clients to reset back to waiting state
         for (const p of lobbyClients.values()) {
@@ -348,12 +356,9 @@ wss.on("connection", (ws, req) => {
 
         log(`[+] Client game claimedUid=${claimedFromUid} effectiveUid=${effectiveUid} addr=${addr}`);
         connectedGameClients++;
-        log(`Client game connections: ${connectedGameClients}/${expectedGameClients}`);
 
         // Route initial packet with effective UID rewritten into from field
         routeGamePacket(ws, data);
-
-        maybeGoSignal();
 
         ws.on("message", (msg) => {
           if (!(msg instanceof Buffer)) msg = Buffer.from(msg);
