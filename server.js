@@ -8,7 +8,8 @@
  *
  * LOBBY PHASE (text JSON):
  *   Server → Client: { type: "waiting", count: N, need: M }
- *   Server → Client: { type: "start", role: "server"|"client" }
+ *   Server → Client: { type: "start", role: "server"|"client", playerCount: N }
+ *   Server → Client: { type: "go" }  (server player only, once all clients connected)
  *
  * GAME PHASE (binary, 8-byte header):
  *   [to: uint32LE][from: uint32LE][payload...]
@@ -29,8 +30,11 @@ let gameStarted = false;
 let serverConn = null;
 let serverDoomUid = null;
 let gameConns = new Map();
-let pendingClientPackets = [];
-let serverLobbyWs = null; // server's lobby WS, kept open until client game connects // packets from clients that arrived before server
+let serverLobbyWs = null; // server's lobby WS, kept open until ALL clients connect
+
+// Track how many Doom game clients we expect vs how many have connected
+let expectedGameClients = 0;
+let connectedGameClients = 0;
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -45,8 +49,9 @@ function resetState() {
   serverConn = null;
   serverDoomUid = null;
   gameConns = new Map();
-  pendingClientPackets = [];
   serverLobbyWs = null;
+  expectedGameClients = 0;
+  connectedGameClients = 0;
   log("State reset.");
 }
 
@@ -60,8 +65,11 @@ const httpServer = http.createServer((req, res) => {
   res.end(JSON.stringify({
     status: "DECHOOM relay OK",
     lobbyClients: lobbyClients.size,
-    gameStarted, serverDoomUid,
+    gameStarted,
+    serverDoomUid,
     gameConns: gameConns.size,
+    expectedGameClients,
+    connectedGameClients,
   }) + "\n");
 });
 
@@ -71,7 +79,6 @@ function sendText(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch (_) {} 
 
 function broadcastWaiting() {
   const players = Array.from(lobbyClients.values()).map(p => p.username ?? "Operator");
-  // First client in the map is always the host
   const hostUid = lobbyClients.size > 0 ? lobbyClients.keys().next().value : null;
   for (const p of lobbyClients.values()) {
     const msg = {
@@ -88,17 +95,24 @@ function broadcastWaiting() {
 
 function startLobby() {
   gameStarted = true;
-  log(`Starting game with ${lobbyClients.size} lobby players`);
+  const totalPlayers = lobbyClients.size;
+  log(`Starting game with ${totalPlayers} lobby players`);
+
+  // We expect (totalPlayers - 1) Doom game client connections before sending go
+  expectedGameClients = totalPlayers - 1;
+  connectedGameClients = 0;
+  log(`Waiting for ${expectedGameClients} Doom game client(s) to connect before sending go`);
+
   let pos = 1;
   for (const p of lobbyClients.values()) {
     if (p.ws.readyState === 1) {
       const role = pos === 1 ? "server" : "client";
       p.role = role; p.ready = true;
-      sendText(p.ws, { type: "start", role, playerCount: lobbyClients.size });
+      sendText(p.ws, { type: "start", role, playerCount: totalPlayers });
       log(`role=${role} → lobby uid=${p.uid}`);
       if (role === "server") {
-        serverLobbyWs = p.ws; // hold open - send "go" when client game connects
-        log(`Holding server lobby ws open for go signal`);
+        serverLobbyWs = p.ws; // held open — go signal sent once all clients are connected
+        log(`Holding server lobby ws open until all ${expectedGameClients} client(s) connect`);
       }
     }
     pos++;
@@ -107,7 +121,6 @@ function startLobby() {
 
 function routeGamePacket(ws, data) {
   const toUid = data.readUInt32LE(0);
-
   const fromUid2 = data.readUInt32LE(4);
   const label = toUid === 0 ? "broadcast" : `uid${fromUid2}→uid${toUid}`;
   log(`pkt ${label} len=${data.length} serverReady=${!!serverConn}`);
@@ -132,6 +145,29 @@ function routeGamePacket(ws, data) {
   }
 }
 
+// Attempt to send the go signal if all expected clients have connected.
+// Called each time a new client game connection is registered.
+function maybeGoSignal() {
+  log(`maybeGoSignal: ${connectedGameClients}/${expectedGameClients} clients connected`);
+  if (!serverLobbyWs) return; // already sent or no server waiting
+  if (expectedGameClients < 1) return; // sanity check
+  if (connectedGameClients < expectedGameClients) return; // not all clients connected yet
+
+  const savedLobbyWs = serverLobbyWs;
+  serverLobbyWs = null;
+
+  // Small delay to let the last client finish its WebSocket handshake
+  // before the server starts sending SYN packets
+  setTimeout(() => {
+    if (savedLobbyWs.readyState === 1) {
+      log(`All ${connectedGameClients} client(s) connected — sending go to server`);
+      sendText(savedLobbyWs, { type: "go" });
+    } else {
+      log(`Server lobby WS closed before go could be sent`);
+    }
+  }, 500);
+}
+
 wss.on("connection", (ws, req) => {
   const addr = req.socket.remoteAddress;
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -149,7 +185,7 @@ wss.on("connection", (ws, req) => {
     broadcastWaiting();
     if (gameStarted && !player.ready) {
       player.role = "client"; player.ready = true;
-      sendText(ws, { type: "start", role: "client" });
+      sendText(ws, { type: "start", role: "client", playerCount: lobbyClients.size });
     }
 
     ws.on("message", (data) => {
@@ -157,16 +193,14 @@ wss.on("connection", (ws, req) => {
         const msg = JSON.parse(data.toString());
         if (msg.type === "lobby" && msg.username) {
           player.username = msg.username;
-          broadcastWaiting(); // re-broadcast with updated name
+          broadcastWaiting();
         } else if (msg.type === "start_game") {
-          // Only the host (first connected) can start
           const hostUid = lobbyClients.keys().next().value;
           if (player.uid === hostUid && lobbyClients.size >= MIN_PLAYERS && !gameStarted) {
             log(`Host uid=${player.uid} started the game`);
             startLobby();
           }
         } else if (msg.type === "kill_event") {
-          // Broadcast named kill to all lobby clients
           const killMsg = JSON.stringify({
             type: "kill_event",
             killer: msg.killer,
@@ -181,22 +215,28 @@ wss.on("connection", (ws, req) => {
         }
       } catch (_) {}
     });
+
     ws.on("close", () => {
       lobbyClients.delete(uid);
       log(`[-] Lobby uid=${uid} remaining=${lobbyClients.size}`);
       if (lobbyClients.size < MIN_PLAYERS) {
         gameStarted = false;
+        expectedGameClients = 0;
+        connectedGameClients = 0;
         if (lobbyClients.size === 0) nextLobbyUid = 1;
       }
       broadcastWaiting();
     });
+
     ws.on("error", (err) => log(`[!] Lobby error uid=${uid}:`, err.message));
 
     setTimeout(() => {
       if (!player.ready && ws.readyState === 1) {
         log(`Lobby timeout uid=${uid}, solo start`);
         player.ready = true; gameStarted = true;
-        sendText(ws, { type: "start", role: "server" });
+        expectedGameClients = 0; // solo — no clients to wait for
+        connectedGameClients = 0;
+        sendText(ws, { type: "start", role: "server", playerCount: 1 });
       }
     }, PLAYER_TIMEOUT_MS);
 
@@ -213,10 +253,8 @@ wss.on("connection", (ws, req) => {
       const toUid = data.readUInt32LE(0);
       ws.doomUid = fromUid;
 
-      // Identify server by instanceUID=1 (hardcoded in d_loop.c for -server)
-      // Any other UID is a client running -connect
+      // Server Doom always connects with instanceUID=1 (hardcoded in d_loop.c)
       const isServerConn = (fromUid === 1);
-
       ws.isServer = isServerConn;
       gameConns.set(fromUid, ws);
 
@@ -224,28 +262,19 @@ wss.on("connection", (ws, req) => {
         serverConn = ws;
         serverDoomUid = 1;
         log(`[+] Server game doomUid=${fromUid} addr=${addr}`);
-        // Forward server's broadcast registration to any already-connected clients
+        // Forward server's initial broadcast to any already-connected clients
         if (toUid === 0) {
           for (const c of gameConns.values()) {
             if (c !== ws && c.readyState === 1) { try { c.send(data); } catch (_) {} }
           }
         }
-
       } else {
         log(`[+] Client game doomUid=${fromUid} addr=${addr}`);
+        connectedGameClients++;
+        log(`Client game connections: ${connectedGameClients}/${expectedGameClients}`);
         routeGamePacket(ws, data);
-        // Signal server lobby to launch Doom now that client is connected
-        // Small delay to allow server Doom to fully init before client sends SYNs
-        if (serverLobbyWs) {
-          const savedLobbyWs = serverLobbyWs;
-          serverLobbyWs = null;
-          setTimeout(() => {
-            if (savedLobbyWs.readyState === 1) {
-              log(`Sending go signal to server lobby`);
-              sendText(savedLobbyWs, { type: "go" });
-            }
-          }, 500);
-        }
+        // Check if all expected clients have now connected; send go if so
+        maybeGoSignal();
       }
 
       ws.on("message", (msg) => {
@@ -255,8 +284,13 @@ wss.on("connection", (ws, req) => {
 
       ws.on("close", () => {
         gameConns.delete(fromUid);
-        if (ws.isServer) { serverConn = null; serverDoomUid = null; log(`[-] Server game disconnected`); }
-        else log(`[-] Client game disconnected doomUid=${fromUid}`);
+        if (ws.isServer) {
+          serverConn = null;
+          serverDoomUid = null;
+          log(`[-] Server game disconnected`);
+        } else {
+          log(`[-] Client game disconnected doomUid=${fromUid}`);
+        }
       });
     });
 
