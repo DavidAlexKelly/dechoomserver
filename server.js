@@ -37,6 +37,7 @@ let nextRemappedUid = 100000;
 let lobbyClients = new Map();
 let nextLobbyUid = 1;
 let gameStarted = false;
+let selectedMap = 1; // host-chosen map number, broadcast to all clients
 
 let serverConn = null;
 let serverDoomUid = null;
@@ -65,6 +66,7 @@ function resetState() {
   serverLobbyWs = null;
   expectedGameClients = 0;
   connectedGameClients = 0;
+  selectedMap = 1;
   log("State reset.");
 }
 
@@ -101,6 +103,7 @@ function broadcastWaiting() {
       players,
       isHost: p.uid === hostUid,
       canStart: lobbyClients.size >= MIN_PLAYERS,
+      selectedMap,
     };
     if (p.ws.readyState === 1) sendText(p.ws, msg);
   }
@@ -120,7 +123,7 @@ function startLobby() {
     if (p.ws.readyState === 1) {
       const role = pos === 1 ? "server" : "client";
       p.role = role; p.ready = true;
-      sendText(p.ws, { type: "start", role, playerCount: totalPlayers });
+      sendText(p.ws, { type: "start", role, playerCount: totalPlayers, map: selectedMap });
       log(`role=${role} → lobby uid=${p.uid}`);
       if (role === "server") {
         serverLobbyWs = p.ws;
@@ -221,6 +224,17 @@ wss.on("connection", (ws, req) => {
         if (msg.type === "lobby" && msg.username) {
           player.username = msg.username;
           broadcastWaiting();
+        } else if (msg.type === "map_select") {
+          // Only host can change the map
+          const hostUid = lobbyClients.keys().next().value;
+          if (player.uid === hostUid && !gameStarted) {
+            const n = parseInt(msg.map, 10);
+            if (n >= 1 && n <= 32) {
+              selectedMap = n;
+              log(`Host selected map ${selectedMap}`);
+              broadcastWaiting();
+            }
+          }
         } else if (msg.type === "start_game") {
           const hostUid = lobbyClients.keys().next().value;
           if (player.uid === hostUid && lobbyClients.size >= MIN_PLAYERS && !gameStarted) {
@@ -255,6 +269,7 @@ wss.on("connection", (ws, req) => {
         expectedGameClients = 0;
         connectedGameClients = 0;
         serverLobbyWs = null;
+        selectedMap = 1;
         // Tell all remaining lobby clients to reset back to waiting state
         for (const p of lobbyClients.values()) {
           if (p.ws.readyState === 1) {
