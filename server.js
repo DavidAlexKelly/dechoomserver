@@ -14,6 +14,12 @@
  * GAME PHASE (binary, 8-byte header):
  *   [to: uint32LE][from: uint32LE][payload...]
  *   Server always appears as uid=1 to clients.
+ *
+ * UID COLLISION HANDLING:
+ *   When two clients (e.g. same browser, same tabs) produce the same instanceUID,
+ *   the relay detects the collision on the first packet and assigns the later
+ *   connection a fresh remapped UID >= 100000. All packets are rewritten
+ *   transparently so Doom never sees the duplicate.
  */
 
 const { WebSocketServer } = require("ws");
@@ -23,18 +29,24 @@ const PORT = process.env.PORT || 2342;
 const MIN_PLAYERS = 2;
 const PLAYER_TIMEOUT_MS = 5 * 60 * 1000;
 
+// UIDs >= 100000 are used for remapped collision UIDs, well clear of
+// Doom's normal small-integer range and the server's hardcoded uid=1.
+let nextRemappedUid = 100000;
+
 let lobbyClients = new Map();
 let nextLobbyUid = 1;
 let gameStarted = false;
 
 let serverConn = null;
 let serverDoomUid = null;
-let gameConns = new Map();
-let serverLobbyWs = null; // server's lobby WS, kept open until ALL clients connect
+let gameConns = new Map(); // effectiveUid → ws
 
-// Track how many Doom game clients we expect vs how many have connected
+// Per-ws metadata: { claimedUid, effectiveUid, isServer }
+const connMeta = new WeakMap();
+
 let expectedGameClients = 0;
 let connectedGameClients = 0;
+let serverLobbyWs = null;
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -98,7 +110,6 @@ function startLobby() {
   const totalPlayers = lobbyClients.size;
   log(`Starting game with ${totalPlayers} lobby players`);
 
-  // We expect (totalPlayers - 1) Doom game client connections before sending go
   expectedGameClients = totalPlayers - 1;
   connectedGameClients = 0;
   log(`Waiting for ${expectedGameClients} Doom game client(s) to connect before sending go`);
@@ -111,7 +122,7 @@ function startLobby() {
       sendText(p.ws, { type: "start", role, playerCount: totalPlayers });
       log(`role=${role} → lobby uid=${p.uid}`);
       if (role === "server") {
-        serverLobbyWs = p.ws; // held open — go signal sent once all clients are connected
+        serverLobbyWs = p.ws;
         log(`Holding server lobby ws open until all ${expectedGameClients} client(s) connect`);
       }
     }
@@ -119,45 +130,52 @@ function startLobby() {
   }
 }
 
-function routeGamePacket(ws, data) {
-  const toUid = data.readUInt32LE(0);
-  const fromUid2 = data.readUInt32LE(4);
-  const label = toUid === 0 ? "broadcast" : `uid${fromUid2}→uid${toUid}`;
+// Return a copy of data with the from field (bytes 4-7) rewritten.
+function rewriteFrom(data, newFromUid) {
+  const out = Buffer.from(data);
+  out.writeUInt32LE(newFromUid, 4);
+  return out;
+}
+
+function routeGamePacket(senderWs, data) {
+  const meta = connMeta.get(senderWs);
+  const effectiveFrom = meta ? meta.effectiveUid : data.readUInt32LE(4);
+
+  // Rewrite from field so all downstream recipients see the effective UID
+  const patchedData = rewriteFrom(data, effectiveFrom);
+  const toUid = patchedData.readUInt32LE(0);
+
+  const label = toUid === 0 ? "broadcast" : `uid${effectiveFrom}→uid${toUid}`;
   log(`pkt ${label} len=${data.length} serverReady=${!!serverConn}`);
 
   if (toUid === 0) {
-    // Broadcast to all other game connections
-    for (const c of gameConns.values()) {
-      if (c !== ws && c.readyState === 1) { try { c.send(data); } catch (_) {} }
+    for (const [, c] of gameConns.entries()) {
+      if (c !== senderWs && c.readyState === 1) {
+        try { c.send(patchedData); } catch (_) {}
+      }
     }
   } else if (toUid === 1) {
-    // Client → server
     if (serverConn && serverConn.readyState === 1) {
-      try { serverConn.send(data); } catch (_) {}
+      try { serverConn.send(patchedData); } catch (_) {}
     } else {
       log(`DROP pkt to server (not connected)`);
     }
   } else {
-    // Unicast to specific UID
     const t = gameConns.get(toUid);
-    if (t && t.readyState === 1) { try { t.send(data); } catch (_) {} }
+    if (t && t.readyState === 1) { try { t.send(patchedData); } catch (_) {} }
     else log(`DROP pkt to uid=${toUid} (not found)`);
   }
 }
 
-// Attempt to send the go signal if all expected clients have connected.
-// Called each time a new client game connection is registered.
 function maybeGoSignal() {
   log(`maybeGoSignal: ${connectedGameClients}/${expectedGameClients} clients connected`);
-  if (!serverLobbyWs) return; // already sent or no server waiting
-  if (expectedGameClients < 1) return; // sanity check
-  if (connectedGameClients < expectedGameClients) return; // not all clients connected yet
+  if (!serverLobbyWs) return;
+  if (expectedGameClients < 1) return;
+  if (connectedGameClients < expectedGameClients) return;
 
   const savedLobbyWs = serverLobbyWs;
   serverLobbyWs = null;
 
-  // Small delay to let the last client finish its WebSocket handshake
-  // before the server starts sending SYN packets
   setTimeout(() => {
     if (savedLobbyWs.readyState === 1) {
       log(`All ${connectedGameClients} client(s) connected — sending go to server`);
@@ -234,7 +252,7 @@ wss.on("connection", (ws, req) => {
       if (!player.ready && ws.readyState === 1) {
         log(`Lobby timeout uid=${uid}, solo start`);
         player.ready = true; gameStarted = true;
-        expectedGameClients = 0; // solo — no clients to wait for
+        expectedGameClients = 0;
         connectedGameClients = 0;
         sendText(ws, { type: "start", role: "server", playerCount: 1 });
       }
@@ -242,56 +260,73 @@ wss.on("connection", (ws, req) => {
 
   } else {
     // ── GAME CONNECTION (Doom -wss) ───────────────────────────────────────────
-    ws.isServer = false;
-    ws.doomUid = null;
-
     ws.once("message", (data) => {
       if (!(data instanceof Buffer)) data = Buffer.from(data);
       if (data.length < 8) { ws.close(); return; }
 
-      const fromUid = data.readUInt32LE(4);
+      const claimedFromUid = data.readUInt32LE(4);
       const toUid = data.readUInt32LE(0);
-      ws.doomUid = fromUid;
-
-      // Server Doom always connects with instanceUID=1 (hardcoded in d_loop.c)
-      const isServerConn = (fromUid === 1);
-      ws.isServer = isServerConn;
-      gameConns.set(fromUid, ws);
+      const isServerConn = (claimedFromUid === 1);
 
       if (isServerConn) {
+        // ── SERVER GAME CONNECTION ────────────────────────────────────────────
+        connMeta.set(ws, { claimedUid: 1, effectiveUid: 1, isServer: true });
+        gameConns.set(1, ws);
         serverConn = ws;
         serverDoomUid = 1;
-        log(`[+] Server game doomUid=${fromUid} addr=${addr}`);
-        // Forward server's initial broadcast to any already-connected clients
+        log(`[+] Server game claimedUid=1 effectiveUid=1 addr=${addr}`);
+
         if (toUid === 0) {
-          for (const c of gameConns.values()) {
+          for (const [, c] of gameConns.entries()) {
             if (c !== ws && c.readyState === 1) { try { c.send(data); } catch (_) {} }
           }
         }
-      } else {
-        log(`[+] Client game doomUid=${fromUid} addr=${addr}`);
-        connectedGameClients++;
-        log(`Client game connections: ${connectedGameClients}/${expectedGameClients}`);
-        routeGamePacket(ws, data);
-        // Check if all expected clients have now connected; send go if so
-        maybeGoSignal();
-      }
 
-      ws.on("message", (msg) => {
-        if (!(msg instanceof Buffer)) msg = Buffer.from(msg);
-        if (msg.length >= 8) routeGamePacket(ws, msg);
-      });
+        ws.on("message", (msg) => {
+          if (!(msg instanceof Buffer)) msg = Buffer.from(msg);
+          if (msg.length >= 8) routeGamePacket(ws, msg);
+        });
 
-      ws.on("close", () => {
-        gameConns.delete(fromUid);
-        if (ws.isServer) {
+        ws.on("close", () => {
+          gameConns.delete(1);
           serverConn = null;
           serverDoomUid = null;
           log(`[-] Server game disconnected`);
-        } else {
-          log(`[-] Client game disconnected doomUid=${fromUid}`);
+        });
+
+      } else {
+        // ── CLIENT GAME CONNECTION ────────────────────────────────────────────
+        let effectiveUid = claimedFromUid;
+
+        if (gameConns.has(claimedFromUid)) {
+          // UID collision — two clients in the same browser produced the same
+          // instanceUID. Assign a unique remapped UID for this connection.
+          effectiveUid = nextRemappedUid++;
+          log(`[!] UID collision: claimedUid=${claimedFromUid} already in use — remapping to effectiveUid=${effectiveUid}`);
         }
-      });
+
+        connMeta.set(ws, { claimedUid: claimedFromUid, effectiveUid, isServer: false });
+        gameConns.set(effectiveUid, ws);
+
+        log(`[+] Client game claimedUid=${claimedFromUid} effectiveUid=${effectiveUid} addr=${addr}`);
+        connectedGameClients++;
+        log(`Client game connections: ${connectedGameClients}/${expectedGameClients}`);
+
+        // Route initial packet with effective UID rewritten into from field
+        routeGamePacket(ws, data);
+
+        maybeGoSignal();
+
+        ws.on("message", (msg) => {
+          if (!(msg instanceof Buffer)) msg = Buffer.from(msg);
+          if (msg.length >= 8) routeGamePacket(ws, msg);
+        });
+
+        ws.on("close", () => {
+          gameConns.delete(effectiveUid);
+          log(`[-] Client game disconnected claimedUid=${claimedFromUid} effectiveUid=${effectiveUid}`);
+        });
+      }
     });
 
     ws.on("error", (err) => log(`[!] Game error ${addr}:`, err.message));
