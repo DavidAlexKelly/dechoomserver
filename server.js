@@ -27,6 +27,7 @@ const http = require("http");
 
 const PORT = process.env.PORT || 2342;
 const MIN_PLAYERS = 2;
+const MAX_PLAYERS = 8; // matches MAXPLAYERS in doomdef.h
 const PLAYER_TIMEOUT_MS = 5 * 60 * 1000;
 
 // UIDs >= 100000 are used for remapped collision UIDs, well clear of
@@ -195,6 +196,14 @@ wss.on("connection", (ws, req) => {
 
   if (isLobby) {
     // ── LOBBY CONNECTION ──────────────────────────────────────────────────────
+    // Reject if lobby is full
+    if (lobbyClients.size >= MAX_PLAYERS) {
+      log(`[!] Lobby full (${lobbyClients.size}/${MAX_PLAYERS}), rejecting`);
+      sendText(ws, { type: 'rejected', reason: `Lobby is full (max ${MAX_PLAYERS} players)` });
+      ws.close();
+      return;
+    }
+
     const uid = nextLobbyUid++;
     const player = { ws, uid, role: null, ready: false };
     lobbyClients.set(uid, player);
