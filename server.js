@@ -53,6 +53,8 @@ let selectedMap = 1;
 let timeLimitMinutes = 10;    // default 10 min; 0 = no limit
 let matchTimer = null;        // setTimeout handle
 let matchStartTime = null;
+let clientsReady = 0;
+let expectedClients = 0;
 
 function lobbyBroadcast(msg) {
   const str = JSON.stringify(msg);
@@ -85,6 +87,8 @@ function endMatch(reason = "Time limit reached") {
   if (matchTimer) { clearTimeout(matchTimer); matchTimer = null; }
   matchInProgress = false;
   matchStartTime  = null;
+  clientsReady = 0;
+  expectedClients = 0;
 
   const scores = lobbyClients.map(c => ({
     username: c.username,
@@ -178,17 +182,15 @@ wss.on("connection", (ws, req) => {
     } else if (msg.type === "start_game" && isHost && !matchInProgress) {
       if (lobbyClients.length < MIN_PLAYERS) return;
       matchInProgress = true;
+      clientsReady = 0; // reset ready counter
+      expectedClients = lobbyClients.length - 1; // everyone except host
 
       const players    = lobbyClients.map(c => c.username);
       const playerCount = lobbyClients.length;
 
-      // Tell host to act as server
-      lobbyClients[0].ws.send(JSON.stringify({
-        type: "start", role: "server", playerCount, players,
-        map: selectedMap, timeLimitMinutes,
-      }));
+      console.log(`[LOBBY] Starting match: ${playerCount} players, map ${selectedMap}, ${timeLimitMinutes} min`);
 
-      // Tell clients to act as clients — stagger slightly
+      // Step 1: Tell all clients to launch Doom first
       lobbyClients.slice(1).forEach((c, i) => {
         setTimeout(() => {
           if (c.ws.readyState !== WebSocket.OPEN) return;
@@ -196,25 +198,38 @@ wss.on("connection", (ws, req) => {
             type: "start", role: "client", playerCount, players,
             map: selectedMap, timeLimitMinutes,
           }));
-        }, (i + 1) * 400);
+          // client_go immediately — they need to connect before host starts listening
+          setTimeout(() => {
+            if (c.ws.readyState === WebSocket.OPEN) {
+              c.ws.send(JSON.stringify({ type: "client_go" }));
+            }
+          }, 800);
+        }, i * 300);
       });
 
-      // Give host a go signal after a short delay for Doom to init
+      // Step 2: Tell host to launch — but hold the "go" until clients are ready
+      // Give host the start message now so it can download/init in parallel
       setTimeout(() => {
         if (lobbyClients[0]?.ws.readyState === WebSocket.OPEN) {
-          lobbyClients[0].ws.send(JSON.stringify({ type: "go" }));
+          lobbyClients[0].ws.send(JSON.stringify({
+            type: "start", role: "server", playerCount, players,
+            map: selectedMap, timeLimitMinutes,
+          }));
         }
-        startMatchTimer();
-      }, 600);
+      }, 200);
+      // host "go" is sent by the client_ready handler below once all clients check in
 
-      // Give clients go signals after host has had time to bind
-      lobbyClients.slice(1).forEach((c, i) => {
-        setTimeout(() => {
-          if (c.ws.readyState === WebSocket.OPEN) {
-            c.ws.send(JSON.stringify({ type: "client_go" }));
-          }
-        }, 3000 + i * 500);
-      });
+    } else if (msg.type === "client_ready") {
+      // Client's Doom is initialised and connected to the binary relay
+      clientsReady++;
+      console.log(`[LOBBY] Client ready: ${clientsReady}/${expectedClients}`);
+      if (clientsReady >= expectedClients && lobbyClients[0]?.ws.readyState === WebSocket.OPEN) {
+        // All clients ready — now tell the host to launch Doom
+        // It will immediately start listening for the already-connected clients
+        console.log(`[LOBBY] All clients ready, sending go to host`);
+        lobbyClients[0].ws.send(JSON.stringify({ type: "go" }));
+        startMatchTimer();
+      }
 
     } else if (msg.type === "kill_event") {
       // Relay to all other lobby clients
