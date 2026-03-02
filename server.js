@@ -29,7 +29,8 @@
 const { WebSocketServer, WebSocket } = require("ws");
 
 const PORT = process.env.PORT || 2342;
-const MIN_PLAYERS = 2;
+const DEV_MODE = process.env.NODE_ENV !== "production";
+const MIN_PLAYERS = DEV_MODE ? 1 : 2;  // In dev, allow starting with 1 player
 const MAX_PLAYERS = 8;
 
 const wss = new WebSocketServer({ port: PORT });
@@ -206,7 +207,22 @@ wss.on("connection", (ws, req) => {
         ws.send(JSON.stringify({ type: "rejected", reason: "Lobby is full" }));
         return;
       }
-      entry = { ws, username: msg.username || "Operative", frags: 0, deaths: 0 };
+      let username = msg.username || "Operative";
+
+      // In dev mode, auto-suffix duplicate usernames so the same person
+      // can test multiple clients from one machine.
+      if (DEV_MODE) {
+        const existing = lobbyClients.map(c => c.username);
+        if (existing.includes(username)) {
+          let suffix = 2;
+          while (existing.includes(`${username} (${suffix})`)) suffix++;
+          const newName = `${username} (${suffix})`;
+          console.log(`[LOBBY][DEV] Duplicate username "${username}" → renamed to "${newName}"`);
+          username = newName;
+        }
+      }
+
+      entry = { ws, username, frags: 0, deaths: 0 };
       lobbyClients.push(entry);
       console.log(`[LOBBY] ${entry.username} joined (${lobbyClients.length} players)`);
       broadcastWaiting();
@@ -339,6 +355,7 @@ wss.on("connection", (ws, req) => {
 wss.on("listening", () => {
   console.log(`DECHOOM relay listening on ws://0.0.0.0:${PORT}`);
   console.log(`Lobby: ws://0.0.0.0:${PORT}/?type=lobby`);
+  if (DEV_MODE) console.log(`[DEV] Dev mode ON — duplicate usernames will be auto-suffixed`);
 });
 
 process.on("SIGTERM", () => {
