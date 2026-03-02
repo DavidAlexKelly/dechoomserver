@@ -47,6 +47,7 @@ function allocateUid() {
 
 // ── Lobby state ───────────────────────────────────────────────────────────────
 // Single lobby; resets when everyone leaves or match ends
+let peekClients = new Set();  // WebSockets watching lobby without joining
 let lobbyClients = [];        // [{ws, username, frags, deaths}]
 let matchInProgress = false;
 let selectedMap = 1;
@@ -67,6 +68,8 @@ function broadcastWaiting() {
   const players = lobbyClients.map(c => c.username);
   const count   = players.length;
   const isEnough = count >= MIN_PLAYERS;
+
+  // Send to joined lobby clients (with isHost / canStart)
   for (let i = 0; i < lobbyClients.length; i++) {
     const c = lobbyClients[i];
     if (c.ws.readyState !== WebSocket.OPEN) continue;
@@ -80,6 +83,20 @@ function broadcastWaiting() {
       selectedMap,
       timeLimitMinutes,
     }));
+  }
+
+  // Send to peek (spectator) connections — read-only view
+  const peekMsg = JSON.stringify({
+    type: "lobby_status",
+    players,
+    count,
+    need: MIN_PLAYERS,
+    selectedMap,
+    timeLimitMinutes,
+    matchInProgress,
+  });
+  for (const ws of peekClients) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(peekMsg);
   }
 }
 
@@ -98,6 +115,9 @@ function endMatch(reason = "Time limit reached") {
 
   lobbyBroadcast({ type: "match_end", scores, reason });
   console.log(`[LOBBY] Match ended: ${reason}`);
+
+  // Notify peek clients that the match is over
+  broadcastWaiting();
 }
 
 function startMatchTimer() {
@@ -145,6 +165,32 @@ wss.on("connection", (ws, req) => {
       binaryClients.delete(uid);
     });
 
+    return;
+  }
+
+  // ── Peek (spectator) client ────────────────────────────────────────────────
+  const isPeek = url.searchParams.get("peek") === "1";
+  if (isPeek) {
+    peekClients.add(ws);
+    console.log(`[PEEK] Spectator connected (${peekClients.size} watching)`);
+
+    // Send current lobby state immediately
+    const players = lobbyClients.map(c => c.username);
+    ws.send(JSON.stringify({
+      type: "lobby_status",
+      players,
+      count: players.length,
+      need: MIN_PLAYERS,
+      selectedMap,
+      timeLimitMinutes,
+      matchInProgress,
+    }));
+
+    ws.on("close", () => {
+      peekClients.delete(ws);
+      console.log(`[PEEK] Spectator disconnected (${peekClients.size} watching)`);
+    });
+    ws.on("error", () => { peekClients.delete(ws); });
     return;
   }
 
