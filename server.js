@@ -5,6 +5,12 @@
  * Two WebSocket endpoints on the same port:
  *   ws://<host>/            — binary Doom net packets
  *   ws://<host>/?type=lobby — JSON lobby/match control messages
+ *
+ * Binary protocol (websockets-doom):
+ *   - On connect: server sends 4 bytes (LE uint32) = assigned UID
+ *   - Packets from client: first 4 bytes = destination UID, bytes 4-7 = source UID
+ *   - Destination UID 0xFFFFFFFF = broadcast to all other clients
+ *   - Server overwrites bytes 4-7 with the real sender UID before forwarding
  */
 
 const { WebSocketServer, WebSocket } = require("ws");
@@ -101,17 +107,51 @@ wss.on("connection", (ws, req) => {
     binaryClients.set(uid, ws);
     console.log(`[+] Binary client uid=${uid} total=${binaryClients.size}`);
 
+    // Send 4-byte hello with assigned UID
     const hello = Buffer.alloc(4);
     hello.writeUInt32LE(uid, 0);
     ws.send(hello);
 
     ws.on("message", (data) => {
       if (!(data instanceof Buffer)) data = Buffer.from(data);
-      if (data.length < 8) return;
+
+      // Doom packets: bytes 0-3 = destination UID, bytes 4-7 = source UID
+      // Minimum valid packet is 1 byte (but realistically needs at least a few
+      // bytes for the Doom net layer). We only need 4 bytes to read the
+      // destination; if the packet has ≥ 8 bytes we stamp the source UID.
+      if (data.length < 4) return;
+
+      const destUid = data.readUInt32LE(0);
+
+      // Stamp the real sender UID into bytes 4-7 (if room)
+      if (data.length >= 8) {
       data.writeUInt32LE(uid, 4);
-      for (const [otherUid, otherWs] of binaryClients)
-        if (otherUid !== uid && otherWs.readyState === WebSocket.OPEN)
+      }
+
+      const BROADCAST = 0xFFFFFFFF;
+
+      if (destUid === BROADCAST || destUid === 0) {
+        // Broadcast: send to all other binary clients
+        for (const [otherUid, otherWs] of binaryClients) {
+          if (otherUid !== uid && otherWs.readyState === WebSocket.OPEN) {
           otherWs.send(data);
+          }
+        }
+      } else {
+        // Unicast: route to the specific destination UID
+        const destWs = binaryClients.get(destUid);
+        if (destWs && destWs.readyState === WebSocket.OPEN) {
+          destWs.send(data);
+    } else {
+          // Destination not found — try broadcast as fallback so the Doom
+          // engine's own timeout / retry logic can handle it
+          for (const [otherUid, otherWs] of binaryClients) {
+            if (otherUid !== uid && otherWs.readyState === WebSocket.OPEN) {
+              otherWs.send(data);
+            }
+          }
+        }
+      }
     });
 
     ws.on("close", () => {
@@ -186,12 +226,20 @@ wss.on("connection", (ws, req) => {
       if (lobbyClients.length < MIN_PLAYERS) return;
       matchInProgress = true;
 
+      // Clear any stale binary connections from previous matches so the
+      // new Doom WASM instances get a clean relay environment.
+      for (const [staleUid, staleWs] of binaryClients) {
+        console.log(`[BINARY] Clearing stale binary client uid=${staleUid} before match start`);
+        try { staleWs.close(1000, "match starting"); } catch {}
+        binaryClients.delete(staleUid);
+      }
+
       const players     = lobbyClients.map(c => c.username);
       const playerCount = lobbyClients.length;
 
       console.log(`[LOBBY] Starting match: ${playerCount} players, map ${selectedMap}, ${timeLimitMinutes} min`);
 
-      // ── NEW LAUNCH SEQUENCE ───────────────────────────────────────────────
+      // ── LAUNCH SEQUENCE ───────────────────────────────────────────────────
       // Step 1: Send all players their "start" packet (triggers asset download)
       //         but DON'T send go/client_go yet.
       lobbyClients.forEach((c, i) => {
@@ -290,3 +338,4 @@ process.on("SIGTERM", () => {
   if (clientGoTimer) clearTimeout(clientGoTimer);
   wss.close();
 });
+
