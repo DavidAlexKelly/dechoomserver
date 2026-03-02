@@ -114,42 +114,16 @@ wss.on("connection", (ws, req) => {
 
     ws.on("message", (data) => {
       if (!(data instanceof Buffer)) data = Buffer.from(data);
+      if (data.length < 8) return;
 
-      // Doom packets: bytes 0-3 = destination UID, bytes 4-7 = source UID
-      // Minimum valid packet is 1 byte (but realistically needs at least a few
-      // bytes for the Doom net layer). We only need 4 bytes to read the
-      // destination; if the packet has ≥ 8 bytes we stamp the source UID.
-      if (data.length < 4) return;
-
-      const destUid = data.readUInt32LE(0);
-
-      // Stamp the real sender UID into bytes 4-7 (if room)
-      if (data.length >= 8) {
+      // Stamp sender UID into bytes 4-7 so receivers know who sent it
       data.writeUInt32LE(uid, 4);
-      }
 
-      const BROADCAST = 0xFFFFFFFF;
-
-      if (destUid === BROADCAST || destUid === 0) {
-        // Broadcast: send to all other binary clients
-        for (const [otherUid, otherWs] of binaryClients) {
-          if (otherUid !== uid && otherWs.readyState === WebSocket.OPEN) {
+      // Simple broadcast relay — Doom's own net layer handles addressing.
+      // The WASM engine reads bytes 0-3 as destination and filters internally.
+      for (const [otherUid, otherWs] of binaryClients) {
+        if (otherUid !== uid && otherWs.readyState === WebSocket.OPEN) {
           otherWs.send(data);
-          }
-        }
-      } else {
-        // Unicast: route to the specific destination UID
-        const destWs = binaryClients.get(destUid);
-        if (destWs && destWs.readyState === WebSocket.OPEN) {
-          destWs.send(data);
-    } else {
-          // Destination not found — try broadcast as fallback so the Doom
-          // engine's own timeout / retry logic can handle it
-          for (const [otherUid, otherWs] of binaryClients) {
-            if (otherUid !== uid && otherWs.readyState === WebSocket.OPEN) {
-              otherWs.send(data);
-            }
-          }
         }
       }
     });
@@ -228,11 +202,14 @@ wss.on("connection", (ws, req) => {
 
       // Clear any stale binary connections from previous matches so the
       // new Doom WASM instances get a clean relay environment.
+      // IMPORTANT: Also reset nextUid to 1 so the host always gets uid=1.
+      // The client Doom WASM uses "-connect 1 1" which hardcodes uid 1 as the server.
       for (const [staleUid, staleWs] of binaryClients) {
         console.log(`[BINARY] Clearing stale binary client uid=${staleUid} before match start`);
         try { staleWs.close(1000, "match starting"); } catch {}
         binaryClients.delete(staleUid);
       }
+      nextUid = 1;
 
       const players     = lobbyClients.map(c => c.username);
       const playerCount = lobbyClients.length;
