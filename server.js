@@ -30,8 +30,12 @@ const { WebSocketServer, WebSocket } = require("ws");
 
 const PORT = process.env.PORT || 2342;
 const DEV_MODE = process.env.NODE_ENV !== "production";
-const MIN_PLAYERS = DEV_MODE ? 1 : 2;  // In dev, allow starting with 1 player
+const MIN_PLAYERS = DEV_MODE ? 1 : 2;
 const MAX_PLAYERS = 8;
+
+// How long after all client_ready signals before we allow sending "go" to host.
+// This gives clients time to actually establish their binary relay WebSocket.
+const CLIENT_READY_BUFFER_MS = 2500;
 
 const wss = new WebSocketServer({ port: PORT });
 
@@ -47,16 +51,72 @@ function allocateUid() {
 }
 
 // ── Lobby state ───────────────────────────────────────────────────────────────
-// Single lobby; resets when everyone leaves or match ends
-let peekClients = new Set();  // WebSockets watching lobby without joining
-let lobbyClients = [];        // [{ws, username, frags, deaths}]
+let peekClients = new Set();
+let lobbyClients = [];
 let matchInProgress = false;
 let selectedMap = 1;
-let timeLimitMinutes = 10;    // default 10 min; 0 = no limit
-let matchTimer = null;        // setTimeout handle
+let timeLimitMinutes = 10;
+let matchTimer = null;
 let matchStartTime = null;
 let clientsReady = 0;
 let expectedClients = 0;
+
+// ── Dual-condition "go" gate ──────────────────────────────────────────────────
+// The host only receives "go" once ALL THREE conditions are true:
+//   1. All clients have sent client_ready  (lobbyReady)
+//   2. Binary relay has >= expectedClients connections  (binaryReady)
+//   3. At least CLIENT_READY_BUFFER_MS has elapsed since condition 1  (timerFired)
+
+let goGate = {
+  active: false,
+  lobbyReady: false,
+  binaryReady: false,
+  timerFired: false,
+  timer: null,
+  sentGo: false,
+};
+
+function resetGoGate() {
+  if (goGate.timer) { clearTimeout(goGate.timer); goGate.timer = null; }
+  goGate = { active: false, lobbyReady: false, binaryReady: false, timerFired: false, timer: null, sentGo: false };
+}
+
+function checkGoGate() {
+  if (!goGate.active || goGate.sentGo) return;
+  if (!goGate.lobbyReady || !goGate.binaryReady || !goGate.timerFired) return;
+
+  goGate.sentGo = true;
+  console.log(`[LOBBY] Go gate satisfied (lobby+binary+timer) — sending go to host`);
+  if (lobbyClients[0]?.ws.readyState === WebSocket.OPEN) {
+    lobbyClients[0].ws.send(JSON.stringify({ type: "go" }));
+    startMatchTimer();
+  }
+}
+
+function markLobbyReady() {
+  if (!goGate.active || goGate.lobbyReady) return;
+  goGate.lobbyReady = true;
+  console.log(`[LOBBY] Go gate: lobby condition met, starting ${CLIENT_READY_BUFFER_MS}ms buffer timer`);
+
+  goGate.timer = setTimeout(() => {
+    goGate.timerFired = true;
+    console.log(`[LOBBY] Go gate: buffer timer fired`);
+    checkGoGate();
+  }, CLIENT_READY_BUFFER_MS);
+
+  checkGoGate();
+}
+
+function checkBinaryReadiness() {
+  if (!goGate.active || goGate.binaryReady) return;
+  if (binaryClients.size >= expectedClients) {
+    goGate.binaryReady = true;
+    console.log(`[LOBBY] Go gate: binary condition met (${binaryClients.size}/${expectedClients} connections)`);
+    checkGoGate();
+  }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function lobbyBroadcast(msg) {
   const str = JSON.stringify(msg);
@@ -66,11 +126,10 @@ function lobbyBroadcast(msg) {
 }
 
 function broadcastWaiting() {
-  const players = lobbyClients.map(c => c.username);
-  const count   = players.length;
+  const players  = lobbyClients.map(c => c.username);
+  const count    = players.length;
   const isEnough = count >= MIN_PLAYERS;
 
-  // Send to joined lobby clients (with isHost / canStart)
   for (let i = 0; i < lobbyClients.length; i++) {
     const c = lobbyClients[i];
     if (c.ws.readyState !== WebSocket.OPEN) continue;
@@ -86,7 +145,6 @@ function broadcastWaiting() {
     }));
   }
 
-  // Send to peek (spectator) connections — read-only view
   const peekMsg = JSON.stringify({
     type: "lobby_status",
     players,
@@ -105,8 +163,9 @@ function endMatch(reason = "Time limit reached") {
   if (matchTimer) { clearTimeout(matchTimer); matchTimer = null; }
   matchInProgress = false;
   matchStartTime  = null;
-  clientsReady = 0;
+  clientsReady    = 0;
   expectedClients = 0;
+  resetGoGate();
 
   const scores = lobbyClients.map(c => ({
     username: c.username,
@@ -116,14 +175,12 @@ function endMatch(reason = "Time limit reached") {
 
   lobbyBroadcast({ type: "match_end", scores, reason });
   console.log(`[LOBBY] Match ended: ${reason}`);
-
-  // Notify peek clients that the match is over
   broadcastWaiting();
 }
 
 function startMatchTimer() {
   if (matchTimer) clearTimeout(matchTimer);
-  if (!timeLimitMinutes) return; // 0 = no limit
+  if (!timeLimitMinutes) return;
   matchStartTime = Date.now();
   const ms = timeLimitMinutes * 60 * 1000;
   matchTimer = setTimeout(() => endMatch("Time limit reached"), ms);
@@ -132,11 +189,11 @@ function startMatchTimer() {
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
-  const url   = new URL(req.url, `http://localhost`);
+  const url     = new URL(req.url, `http://localhost`);
   const isLobby = url.searchParams.get("type") === "lobby";
 
   if (!isLobby) {
-    // ── Binary relay ──────────────────────────────────────────────────────────
+    // ── Binary relay ────────────────────────────────────────────────────────
     const uid = allocateUid();
     binaryClients.set(uid, ws);
     console.log(`[+] Binary client uid=${uid} total=${binaryClients.size}`);
@@ -144,6 +201,9 @@ wss.on("connection", (ws, req) => {
     const hello = Buffer.alloc(4);
     hello.writeUInt32LE(uid, 0);
     ws.send(hello);
+
+    // Every new binary connection might satisfy the go gate
+    checkBinaryReadiness();
 
     ws.on("message", (data) => {
       if (!(data instanceof Buffer)) data = Buffer.from(data);
@@ -169,13 +229,12 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  // ── Peek (spectator) client ────────────────────────────────────────────────
+  // ── Peek (spectator) client ──────────────────────────────────────────────
   const isPeek = url.searchParams.get("peek") === "1";
   if (isPeek) {
     peekClients.add(ws);
     console.log(`[PEEK] Spectator connected (${peekClients.size} watching)`);
 
-    // Send current lobby state immediately
     const players = lobbyClients.map(c => c.username);
     ws.send(JSON.stringify({
       type: "lobby_status",
@@ -195,8 +254,8 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  // ── Lobby client ─────────────────────────────────────────────────────────────
-  let entry = null; // filled on "lobby" message
+  // ── Lobby client ─────────────────────────────────────────────────────────
+  let entry = null;
 
   ws.on("message", (raw) => {
     let msg;
@@ -209,8 +268,6 @@ wss.on("connection", (ws, req) => {
       }
       let username = msg.username || "Operative";
 
-      // In dev mode, auto-suffix duplicate usernames so the same person
-      // can test multiple clients from one machine.
       if (DEV_MODE) {
         const existing = lobbyClients.map(c => c.username);
         if (existing.includes(username)) {
@@ -229,7 +286,7 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    if (!entry) return; // must have joined first
+    if (!entry) return;
 
     const isHost = lobbyClients[0] === entry;
 
@@ -244,13 +301,24 @@ wss.on("connection", (ws, req) => {
     } else if (msg.type === "start_game" && isHost && !matchInProgress) {
       if (lobbyClients.length < MIN_PLAYERS) return;
       matchInProgress = true;
-      clientsReady = 0; // reset ready counter
-      expectedClients = lobbyClients.length - 1; // everyone except host
+      clientsReady    = 0;
+      expectedClients = lobbyClients.length - 1;
 
-      const players    = lobbyClients.map(c => c.username);
+      const players     = lobbyClients.map(c => c.username);
       const playerCount = lobbyClients.length;
 
       console.log(`[LOBBY] Starting match: ${playerCount} players, map ${selectedMap}, ${timeLimitMinutes} min`);
+
+      // Arm the dual-condition go gate
+      resetGoGate();
+      goGate.active = true;
+
+      // Dev mode: no clients to wait for — pre-satisfy all client conditions
+      if (expectedClients === 0) {
+        goGate.lobbyReady  = true;
+        goGate.binaryReady = true;
+        goGate.timerFired  = true;
+      }
 
       // Step 1: Tell all clients to launch Doom first
       lobbyClients.slice(1).forEach((c, i) => {
@@ -260,7 +328,6 @@ wss.on("connection", (ws, req) => {
             type: "start", role: "client", playerCount, players,
             map: selectedMap, timeLimitMinutes,
           }));
-          // client_go immediately — they need to connect before host starts listening
           setTimeout(() => {
             if (c.ws.readyState === WebSocket.OPEN) {
               c.ws.send(JSON.stringify({ type: "client_go" }));
@@ -269,8 +336,8 @@ wss.on("connection", (ws, req) => {
         }, i * 300);
       });
 
-      // Step 2: Tell host to launch — but hold the "go" until clients are ready
-      // Give host the start message now so it can download/init in parallel
+      // Step 2: Send host "start" now so it can download/init in parallel.
+      // The actual "go" is held by the gate until clients are confirmed ready.
       setTimeout(() => {
         if (lobbyClients[0]?.ws.readyState === WebSocket.OPEN) {
           lobbyClients[0].ws.send(JSON.stringify({
@@ -278,30 +345,23 @@ wss.on("connection", (ws, req) => {
             map: selectedMap, timeLimitMinutes,
           }));
         }
+        if (expectedClients === 0) checkGoGate();
       }, 200);
-      // host "go" is sent by the client_ready handler below once all clients check in
 
     } else if (msg.type === "client_ready") {
-      // Client's Doom is initialised and connected to the binary relay
       clientsReady++;
       console.log(`[LOBBY] Client ready: ${clientsReady}/${expectedClients}`);
-      if (clientsReady >= expectedClients && lobbyClients[0]?.ws.readyState === WebSocket.OPEN) {
-        // All clients ready — now tell the host to launch Doom
-        // It will immediately start listening for the already-connected clients
-        console.log(`[LOBBY] All clients ready, sending go to host`);
-        lobbyClients[0].ws.send(JSON.stringify({ type: "go" }));
-        startMatchTimer();
+      if (clientsReady >= expectedClients) {
+        markLobbyReady();
       }
 
     } else if (msg.type === "kill_event") {
-      // Relay to all other lobby clients
       const str = JSON.stringify({ type: "kill_event", killer: msg.killer, victim: msg.victim });
       for (const c of lobbyClients) {
         if (c !== entry && c.ws.readyState === WebSocket.OPEN) c.ws.send(str);
       }
 
     } else if (msg.type === "frag_update") {
-      // Update score for this player and broadcast to everyone
       entry.frags  = msg.frags  ?? entry.frags;
       entry.deaths = msg.deaths ?? entry.deaths;
       const str = JSON.stringify({
@@ -324,19 +384,16 @@ wss.on("connection", (ws, req) => {
 
     if (matchInProgress) {
       if (lobbyClients.length < 1) {
-        // Everyone gone — just clean up
         endMatch("All players disconnected");
-        lobbyClients = [];
-        selectedMap = 1;
+        lobbyClients    = [];
+        selectedMap     = 1;
         timeLimitMinutes = 10;
       } else {
-        // Notify remaining players
         lobbyBroadcast({ type: "lobby_reset", reason: `${entry.username} disconnected` });
       }
     } else {
       if (lobbyClients.length === 0) {
-        // Empty lobby — full reset
-        selectedMap = 1;
+        selectedMap      = 1;
         timeLimitMinutes = 10;
       } else {
         if (wasHost) {
@@ -361,5 +418,6 @@ wss.on("listening", () => {
 process.on("SIGTERM", () => {
   console.log("Shutting down...");
   if (matchTimer) clearTimeout(matchTimer);
+  if (goGate.timer) clearTimeout(goGate.timer);
   wss.close();
 });
