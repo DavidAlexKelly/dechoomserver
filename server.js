@@ -3,34 +3,14 @@
  * DECHOOM Multiplayer Relay Server
  *
  * Two WebSocket endpoints on the same port:
- *   ws://<host>/          — binary Doom net packets (unchanged)
+ *   ws://<host>/            — binary Doom net packets
  *   ws://<host>/?type=lobby — JSON lobby/match control messages
  *
- * Lobby message types (client → server):
- *   { type: "lobby", username, color? }               — join lobby (color: 0-3)
- *   { type: "color_select", color: n }                — update own colour (0-3)
- *   { type: "start_game" }                            — host starts match
- *   { type: "map_select", map: n }                    — host picks map
- *   { type: "time_limit", minutes: n }                — host sets time limit (0 = no limit)
- *   { type: "kill_event", killer, victim }             — in-game frag broadcast
- *   { type: "frag_update", username, frags, deaths }  — live score sync
- *
- * Lobby message types (server → client):
- *   { type: "waiting", players, colors, count, need, isHost, canStart, selectedMap, timeLimitMinutes }
- *   { type: "start", role, playerCount, players, colors, map, timeLimitMinutes }
- *   { type: "go" }          — server player launches
- *   { type: "client_go" }   — client player launches
- *   { type: "lobby_reset", reason }
- *   { type: "rejected", reason }
- *   { type: "kill_event", killer, victim }
- *   { type: "frag_update", username, frags, deaths }
- *   { type: "match_end", scores: [{username, frags, deaths}], reason }
- *
- * Color indices (match Doom's MF_TRANSLATION slots):
- *   0 = Green (default)
- *   1 = Grey / Indigo
- *   2 = Brown
- *   3 = Red
+ * Binary protocol (websockets-doom):
+ *   - On connect: server sends 4 bytes (LE uint32) = assigned UID
+ *   - Packets from client: first 4 bytes = destination UID, bytes 4-7 = source UID
+ *   - Destination UID 0xFFFFFFFF = broadcast to all other clients
+ *   - Server overwrites bytes 4-7 with the real sender UID before forwarding
  */
 
 const { WebSocketServer, WebSocket } = require("ws");
@@ -40,92 +20,69 @@ const DEV_MODE = process.env.NODE_ENV !== "production";
 const MIN_PLAYERS = DEV_MODE ? 1 : 2;
 const MAX_PLAYERS = 8;
 
+// How long the host Doom gets to start and open its listening socket
+// before clients are told to connect.
+const HOST_HEADSTART_MS = 4000;
+
 const wss = new WebSocketServer({ port: PORT });
 
 // ── Binary relay state ────────────────────────────────────────────────────────
-const binaryClients = new Map(); // uid → ws
+const binaryClients = new Map();
 let nextUid = 1;
 
 function allocateUid() {
-  while (binaryClients.has(nextUid)) {
-    nextUid = (nextUid % 0xfffe) + 1;
-  }
+  while (binaryClients.has(nextUid)) nextUid = (nextUid % 0xfffe) + 1;
   return nextUid++;
 }
 
 // ── Lobby state ───────────────────────────────────────────────────────────────
-let peekClients = new Set();
-let lobbyClients = [];   // [{ws, username, color, frags, deaths}]
-let matchInProgress = false;
-let selectedMap = 1;
+let peekClients      = new Set();
+let lobbyClients     = [];
+let matchInProgress  = false;
+let selectedMap      = 1;
 let timeLimitMinutes = 10;
-let matchTimer = null;
-let matchStartTime = null;
-let clientsReady = 0;
-let expectedClients = 0;
-
-function clampColor(c) {
-  const n = parseInt(c);
-  return (Number.isFinite(n) && n >= 0 && n <= 3) ? n : 0;
-}
+let matchTimer       = null;
+let matchStartTime   = null;
+let clientGoTimer    = null; // pending setTimeout for sending client_go messages
 
 function lobbyBroadcast(msg) {
   const str = JSON.stringify(msg);
-  for (const c of lobbyClients) {
+  for (const c of lobbyClients)
     if (c.ws.readyState === WebSocket.OPEN) c.ws.send(str);
-  }
 }
 
 function broadcastWaiting() {
-  const players = lobbyClients.map(c => c.username);
-  const colors  = lobbyClients.map(c => c.color);
-  const count   = players.length;
+  const players  = lobbyClients.map(c => c.username);
+  const colors   = lobbyClients.map(c => c.color ?? 0);
+  const count    = players.length;
   const isEnough = count >= MIN_PLAYERS;
 
   for (let i = 0; i < lobbyClients.length; i++) {
     const c = lobbyClients[i];
     if (c.ws.readyState !== WebSocket.OPEN) continue;
     c.ws.send(JSON.stringify({
-      type: "waiting",
-      players,
-      colors,
-      count,
-      need: MIN_PLAYERS,
-      isHost: i === 0,
-      canStart: isEnough,
-      selectedMap,
-      timeLimitMinutes,
+      type: "waiting", players, colors, count, need: MIN_PLAYERS,
+      isHost: i === 0, canStart: isEnough, selectedMap, timeLimitMinutes,
     }));
   }
 
-  // Peek (spectator) clients
   const peekMsg = JSON.stringify({
-    type: "lobby_status",
-    players,
-    colors,
-    count,
-    need: MIN_PLAYERS,
-    selectedMap,
-    timeLimitMinutes,
-    matchInProgress,
+    type: "lobby_status", players, colors, count, need: MIN_PLAYERS,
+    selectedMap, timeLimitMinutes, matchInProgress,
   });
-  for (const ws of peekClients) {
+  for (const ws of peekClients)
     if (ws.readyState === WebSocket.OPEN) ws.send(peekMsg);
-  }
 }
 
 function endMatch(reason = "Time limit reached") {
-  if (matchTimer) { clearTimeout(matchTimer); matchTimer = null; }
+  if (matchTimer)   { clearTimeout(matchTimer);   matchTimer   = null; }
+  if (clientGoTimer){ clearTimeout(clientGoTimer); clientGoTimer = null; }
   matchInProgress = false;
   matchStartTime  = null;
-  clientsReady = 0;
-  expectedClients = 0;
 
-  const scores = lobbyClients.map(c => ({
-    username: c.username,
-    frags:    c.frags,
-    deaths:   c.deaths,
-  })).sort((a, b) => b.frags - a.frags);
+  const scores = lobbyClients
+    .map(c => ({ username: c.username, frags: c.frags, deaths: c.deaths }))
+    .sort((a, b) => b.frags - a.frags);
 
   lobbyBroadcast({ type: "match_end", scores, reason });
   console.log(`[LOBBY] Match ended: ${reason}`);
@@ -136,14 +93,13 @@ function startMatchTimer() {
   if (matchTimer) clearTimeout(matchTimer);
   if (!timeLimitMinutes) return;
   matchStartTime = Date.now();
-  const ms = timeLimitMinutes * 60 * 1000;
-  matchTimer = setTimeout(() => endMatch("Time limit reached"), ms);
+  matchTimer = setTimeout(() => endMatch("Time limit reached"), timeLimitMinutes * 60 * 1000);
   console.log(`[LOBBY] Match timer started: ${timeLimitMinutes} min`);
 }
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
-  const url    = new URL(req.url, `http://localhost`);
+  const url     = new URL(req.url, `http://localhost`);
   const isLobby = url.searchParams.get("type") === "lobby";
 
   if (!isLobby) {
@@ -152,6 +108,7 @@ wss.on("connection", (ws, req) => {
     binaryClients.set(uid, ws);
     console.log(`[+] Binary client uid=${uid} total=${binaryClients.size}`);
 
+    // Send 4-byte hello with assigned UID
     const hello = Buffer.alloc(4);
     hello.writeUInt32LE(uid, 0);
     ws.send(hello);
@@ -159,7 +116,12 @@ wss.on("connection", (ws, req) => {
     ws.on("message", (data) => {
       if (!(data instanceof Buffer)) data = Buffer.from(data);
       if (data.length < 8) return;
+
+      // Stamp sender UID into bytes 4-7 so receivers know who sent it
       data.writeUInt32LE(uid, 4);
+
+      // Simple broadcast relay — Doom's own net layer handles addressing.
+      // The WASM engine reads bytes 0-3 as destination and filters internally.
       for (const [otherUid, otherWs] of binaryClients) {
         if (otherUid !== uid && otherWs.readyState === WebSocket.OPEN) {
           otherWs.send(data);
@@ -180,30 +142,19 @@ wss.on("connection", (ws, req) => {
     return;
   }
 
-  // ── Peek (spectator) client ────────────────────────────────────────────────
+  // ── Peek (spectator) client ───────────────────────────────────────────────
   const isPeek = url.searchParams.get("peek") === "1";
   if (isPeek) {
     peekClients.add(ws);
     console.log(`[PEEK] Spectator connected (${peekClients.size} watching)`);
-
     const players = lobbyClients.map(c => c.username);
-    const colors  = lobbyClients.map(c => c.color);
+    const colors  = lobbyClients.map(c => c.color ?? 0);
     ws.send(JSON.stringify({
-      type: "lobby_status",
-      players,
-      colors,
-      count: players.length,
-      need: MIN_PLAYERS,
-      selectedMap,
-      timeLimitMinutes,
-      matchInProgress,
+      type: "lobby_status", players, colors, count: players.length,
+      need: MIN_PLAYERS, selectedMap, timeLimitMinutes, matchInProgress,
     }));
-
-    ws.on("close", () => {
-      peekClients.delete(ws);
-      console.log(`[PEEK] Spectator disconnected (${peekClients.size} watching)`);
-    });
-    ws.on("error", () => { peekClients.delete(ws); });
+    ws.on("close", () => { peekClients.delete(ws); console.log(`[PEEK] Spectator disconnected (${peekClients.size} watching)`); });
+    ws.on("error", () => peekClients.delete(ws));
     return;
   }
 
@@ -220,37 +171,29 @@ wss.on("connection", (ws, req) => {
         return;
       }
       let username = msg.username || "Operative";
-      const color  = clampColor(msg.color ?? 0);
-
       if (DEV_MODE) {
         const existing = lobbyClients.map(c => c.username);
         if (existing.includes(username)) {
           let suffix = 2;
           while (existing.includes(`${username} (${suffix})`)) suffix++;
-          const newName = `${username} (${suffix})`;
-          console.log(`[LOBBY][DEV] Duplicate username "${username}" → renamed to "${newName}"`);
-          username = newName;
+          username = `${username} (${suffix})`;
+          console.log(`[LOBBY][DEV] Renamed duplicate to "${username}"`);
         }
       }
-
-      entry = { ws, username, color, frags: 0, deaths: 0 };
+      entry = { ws, username, color: msg.color ?? 0, frags: 0, deaths: 0 };
       lobbyClients.push(entry);
-      console.log(`[LOBBY] ${entry.username} joined with color=${color} (${lobbyClients.length} players)`);
+      console.log(`[LOBBY] ${entry.username} joined (${lobbyClients.length} players) color=${entry.color}`);
       broadcastWaiting();
       return;
     }
 
     if (!entry) return;
-
     const isHost = lobbyClients[0] === entry;
 
     if (msg.type === "color_select") {
-      // Any player can update their own colour at any time before match starts
-      if (!matchInProgress) {
-        entry.color = clampColor(msg.color ?? 0);
-        console.log(`[LOBBY] ${entry.username} changed color to ${entry.color}`);
-        broadcastWaiting();
-      }
+      entry.color = msg.color ?? 0;
+      console.log(`[LOBBY] ${entry.username} changed color to ${entry.color}`);
+      broadcastWaiting();
 
     } else if (msg.type === "map_select" && isHost && !matchInProgress) {
       selectedMap = msg.map ?? 1;
@@ -263,69 +206,81 @@ wss.on("connection", (ws, req) => {
     } else if (msg.type === "start_game" && isHost && !matchInProgress) {
       if (lobbyClients.length < MIN_PLAYERS) return;
       matchInProgress = true;
-      clientsReady = 0;
-      expectedClients = lobbyClients.length - 1;
 
-      const players    = lobbyClients.map(c => c.username);
-      const colors     = lobbyClients.map(c => c.color);
+      // Clear any stale binary connections from previous matches so the
+      // new Doom WASM instances get a clean relay environment.
+      // IMPORTANT: Also reset nextUid to 1 so the host always gets uid=1.
+      // The client Doom WASM uses "-connect 1 1" which hardcodes uid 1 as the server.
+      for (const [staleUid, staleWs] of binaryClients) {
+        console.log(`[BINARY] Clearing stale binary client uid=${staleUid} before match start`);
+        try { staleWs.close(1000, "match starting"); } catch {}
+        binaryClients.delete(staleUid);
+      }
+      nextUid = 1;
+
+      const players     = lobbyClients.map(c => c.username);
       const playerCount = lobbyClients.length;
 
       console.log(`[LOBBY] Starting match: ${playerCount} players, map ${selectedMap}, ${timeLimitMinutes} min`);
-      console.log(`[LOBBY] Player colors: ${colors.join(", ")}`);
 
-      // Step 1: Tell all clients to launch Doom first (with color info)
-      lobbyClients.slice(1).forEach((c, i) => {
+      // ── LAUNCH SEQUENCE ───────────────────────────────────────────────────
+      // Step 1: Send all players their "start" packet (triggers asset download)
+      //         but DON'T send go/client_go yet.
+      const colors = lobbyClients.map(c => c.color ?? 0);
+
+      lobbyClients.forEach((c, i) => {
+        const role = i === 0 ? "server" : "client";
         setTimeout(() => {
           if (c.ws.readyState !== WebSocket.OPEN) return;
           c.ws.send(JSON.stringify({
-            type: "start", role: "client", playerCount, players, colors,
+            type: "start", role, playerCount, players, colors,
             map: selectedMap, timeLimitMinutes,
           }));
-          setTimeout(() => {
-            if (c.ws.readyState === WebSocket.OPEN) {
-              c.ws.send(JSON.stringify({ type: "client_go" }));
-            }
-          }, 800);
-        }, i * 300);
+        }, i * 200);
       });
 
-      // Step 2: Tell host to prepare (with color info), hold "go" until clients ready
+      // Step 2: Send "go" to host after a short delay so it starts downloading.
+      // Host Doom will start and sit waiting for client connections.
       setTimeout(() => {
         if (lobbyClients[0]?.ws.readyState === WebSocket.OPEN) {
-          lobbyClients[0].ws.send(JSON.stringify({
-            type: "start", role: "server", playerCount, players, colors,
-            map: selectedMap, timeLimitMinutes,
-          }));
+          console.log(`[LOBBY] Sending go to host`);
+          lobbyClients[0].ws.send(JSON.stringify({ type: "go" }));
         }
-      }, 200);
+      }, 500);
+
+      // Step 3: After giving the host a head-start to get its Doom listening,
+      // tell clients to connect. HOST_HEADSTART_MS after the host go signal.
+      clientGoTimer = setTimeout(() => {
+        clientGoTimer = null;
+        lobbyClients.slice(1).forEach((c, i) => {
+          setTimeout(() => {
+            if (c.ws.readyState !== WebSocket.OPEN) return;
+            console.log(`[LOBBY] Sending client_go to ${c.username}`);
+            c.ws.send(JSON.stringify({ type: "client_go" }));
+          }, i * 300);
+        });
+        startMatchTimer();
+      }, 500 + HOST_HEADSTART_MS);
+      // ─────────────────────────────────────────────────────────────────────
 
     } else if (msg.type === "client_ready") {
-      clientsReady++;
-      console.log(`[LOBBY] Client ready: ${clientsReady}/${expectedClients}`);
-      if (clientsReady >= expectedClients && lobbyClients[0]?.ws.readyState === WebSocket.OPEN) {
-        console.log(`[LOBBY] All clients ready, sending go to host`);
-        lobbyClients[0].ws.send(JSON.stringify({ type: "go" }));
-        startMatchTimer();
-      }
+      // No longer used to gate the host launch — kept for compatibility
+      console.log(`[LOBBY] client_ready received from ${entry.username} (informational)`);
 
     } else if (msg.type === "kill_event") {
       const str = JSON.stringify({ type: "kill_event", killer: msg.killer, victim: msg.victim });
-      for (const c of lobbyClients) {
+      for (const c of lobbyClients)
         if (c !== entry && c.ws.readyState === WebSocket.OPEN) c.ws.send(str);
-      }
 
     } else if (msg.type === "frag_update") {
       entry.frags  = msg.frags  ?? entry.frags;
       entry.deaths = msg.deaths ?? entry.deaths;
       const str = JSON.stringify({
-        type: "frag_update",
-        username: entry.username,
-        frags:    entry.frags,
-        deaths:   entry.deaths,
+        type: "frag_update", username: entry.username,
+        frags: entry.frags, deaths: entry.deaths,
       });
-      for (const c of lobbyClients) {
+      for (const c of lobbyClients)
         if (c.ws.readyState === WebSocket.OPEN) c.ws.send(str);
-      }
     }
   });
 
@@ -338,38 +293,35 @@ wss.on("connection", (ws, req) => {
     if (matchInProgress) {
       if (lobbyClients.length < 1) {
         endMatch("All players disconnected");
-        lobbyClients = [];
-        selectedMap = 1;
+        lobbyClients     = [];
+        selectedMap      = 1;
         timeLimitMinutes = 10;
       } else {
         lobbyBroadcast({ type: "lobby_reset", reason: `${entry.username} disconnected` });
       }
     } else {
       if (lobbyClients.length === 0) {
-        selectedMap = 1;
-        timeLimitMinutes = 10;
+        selectedMap = 1; timeLimitMinutes = 10;
       } else {
-        if (wasHost) {
-          console.log(`[LOBBY] Host left, ${lobbyClients[0].username} is new host`);
-        }
+        if (wasHost) console.log(`[LOBBY] Host left, ${lobbyClients[0].username} is new host`);
         broadcastWaiting();
       }
     }
   });
 
-  ws.on("error", (err) => {
-    console.error(`[LOBBY] Error:`, err.message);
-  });
+  ws.on("error", (err) => console.error(`[LOBBY] Error:`, err.message));
 });
 
 wss.on("listening", () => {
   console.log(`DECHOOM relay listening on ws://0.0.0.0:${PORT}`);
   console.log(`Lobby: ws://0.0.0.0:${PORT}/?type=lobby`);
-  if (DEV_MODE) console.log(`[DEV] Dev mode ON — duplicate usernames will be auto-suffixed`);
+  if (DEV_MODE) console.log(`[DEV] Dev mode ON`);
 });
 
 process.on("SIGTERM", () => {
   console.log("Shutting down...");
-  if (matchTimer) clearTimeout(matchTimer);
+  if (matchTimer)    clearTimeout(matchTimer);
+  if (clientGoTimer) clearTimeout(clientGoTimer);
   wss.close();
 });
+
