@@ -7,7 +7,7 @@
  *   ws://<host>/?type=lobby — JSON lobby/match control messages
  *
  * Binary protocol (websockets-doom):
- *   - On connect: server sends 4 bytes (LE uint32) = assigned UID
+ *   - On connect: server sends 4 bytes = assigned UID
  *   - Packets from client: first 4 bytes = destination UID, bytes 4-7 = source UID
  *   - Destination UID 0xFFFFFFFF = broadcast to all other clients
  *   - Server overwrites bytes 4-7 with the real sender UID before forwarding
