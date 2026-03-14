@@ -16,8 +16,7 @@
 const { WebSocketServer, WebSocket } = require("ws");
 
 const PORT = process.env.PORT || 2342;
-const DEV_MODE = process.env.NODE_ENV !== "production";
-const MIN_PLAYERS = DEV_MODE ? 1 : 2;
+const MIN_PLAYERS = 1;
 const MAX_PLAYERS = 8;
 
 // How long the host Doom gets to start and open its listening socket
@@ -43,7 +42,7 @@ let selectedMap      = 1;
 let timeLimitMinutes = 10;
 let matchTimer       = null;
 let matchStartTime   = null;
-let clientGoTimer    = null; // pending setTimeout for sending client_go messages
+let clientGoTimer    = null;
 
 function lobbyBroadcast(msg) {
   const str = JSON.stringify(msg);
@@ -75,8 +74,8 @@ function broadcastWaiting() {
 }
 
 function endMatch(reason = "Time limit reached") {
-  if (matchTimer)   { clearTimeout(matchTimer);   matchTimer   = null; }
-  if (clientGoTimer){ clearTimeout(clientGoTimer); clientGoTimer = null; }
+  if (matchTimer)    { clearTimeout(matchTimer);    matchTimer    = null; }
+  if (clientGoTimer) { clearTimeout(clientGoTimer); clientGoTimer = null; }
   matchInProgress = false;
   matchStartTime  = null;
 
@@ -108,7 +107,6 @@ wss.on("connection", (ws, req) => {
     binaryClients.set(uid, ws);
     console.log(`[+] Binary client uid=${uid} total=${binaryClients.size}`);
 
-    // Send 4-byte hello with assigned UID
     const hello = Buffer.alloc(4);
     hello.writeUInt32LE(uid, 0);
     ws.send(hello);
@@ -116,12 +114,7 @@ wss.on("connection", (ws, req) => {
     ws.on("message", (data) => {
       if (!(data instanceof Buffer)) data = Buffer.from(data);
       if (data.length < 8) return;
-
-      // Stamp sender UID into bytes 4-7 so receivers know who sent it
       data.writeUInt32LE(uid, 4);
-
-      // Simple broadcast relay — Doom's own net layer handles addressing.
-      // The WASM engine reads bytes 0-3 as destination and filters internally.
       for (const [otherUid, otherWs] of binaryClients) {
         if (otherUid !== uid && otherWs.readyState === WebSocket.OPEN) {
           otherWs.send(data);
@@ -171,14 +164,12 @@ wss.on("connection", (ws, req) => {
         return;
       }
       let username = msg.username || "Operative";
-      if (DEV_MODE) {
-        const existing = lobbyClients.map(c => c.username);
-        if (existing.includes(username)) {
-          let suffix = 2;
-          while (existing.includes(`${username} (${suffix})`)) suffix++;
-          username = `${username} (${suffix})`;
-          console.log(`[LOBBY][DEV] Renamed duplicate to "${username}"`);
-        }
+      const existing = lobbyClients.map(c => c.username);
+      if (existing.includes(username)) {
+        let suffix = 2;
+        while (existing.includes(`${username} (${suffix})`)) suffix++;
+        username = `${username} (${suffix})`;
+        console.log(`[LOBBY] Renamed duplicate to "${username}"`);
       }
       entry = { ws, username, color: msg.color ?? 0, frags: 0, deaths: 0 };
       lobbyClients.push(entry);
@@ -207,10 +198,6 @@ wss.on("connection", (ws, req) => {
       if (lobbyClients.length < MIN_PLAYERS) return;
       matchInProgress = true;
 
-      // Clear any stale binary connections from previous matches so the
-      // new Doom WASM instances get a clean relay environment.
-      // IMPORTANT: Also reset nextUid to 1 so the host always gets uid=1.
-      // The client Doom WASM uses "-connect 1 1" which hardcodes uid 1 as the server.
       for (const [staleUid, staleWs] of binaryClients) {
         console.log(`[BINARY] Clearing stale binary client uid=${staleUid} before match start`);
         try { staleWs.close(1000, "match starting"); } catch {}
@@ -220,14 +207,12 @@ wss.on("connection", (ws, req) => {
 
       const players     = lobbyClients.map(c => c.username);
       const playerCount = lobbyClients.length;
+      const colors      = lobbyClients.map(c => c.color ?? 0);
 
       console.log(`[LOBBY] Starting match: ${playerCount} players, map ${selectedMap}, ${timeLimitMinutes} min`);
 
       // ── LAUNCH SEQUENCE ───────────────────────────────────────────────────
       // Step 1: Send all players their "start" packet (triggers asset download)
-      //         but DON'T send go/client_go yet.
-      const colors = lobbyClients.map(c => c.color ?? 0);
-
       lobbyClients.forEach((c, i) => {
         const role = i === 0 ? "server" : "client";
         setTimeout(() => {
@@ -239,8 +224,7 @@ wss.on("connection", (ws, req) => {
         }, i * 200);
       });
 
-      // Step 2: Send "go" to host after a short delay so it starts downloading.
-      // Host Doom will start and sit waiting for client connections.
+      // Step 2: Send "go" to host — it starts Doom and waits for clients
       setTimeout(() => {
         if (lobbyClients[0]?.ws.readyState === WebSocket.OPEN) {
           console.log(`[LOBBY] Sending go to host`);
@@ -248,8 +232,7 @@ wss.on("connection", (ws, req) => {
         }
       }, 500);
 
-      // Step 3: After giving the host a head-start to get its Doom listening,
-      // tell clients to connect. HOST_HEADSTART_MS after the host go signal.
+      // Step 3: After host headstart, tell clients to connect
       clientGoTimer = setTimeout(() => {
         clientGoTimer = null;
         lobbyClients.slice(1).forEach((c, i) => {
@@ -264,7 +247,6 @@ wss.on("connection", (ws, req) => {
       // ─────────────────────────────────────────────────────────────────────
 
     } else if (msg.type === "client_ready") {
-      // No longer used to gate the host launch — kept for compatibility
       console.log(`[LOBBY] client_ready received from ${entry.username} (informational)`);
 
     } else if (msg.type === "kill_event") {
@@ -315,7 +297,6 @@ wss.on("connection", (ws, req) => {
 wss.on("listening", () => {
   console.log(`DECHOOM relay listening on ws://0.0.0.0:${PORT}`);
   console.log(`Lobby: ws://0.0.0.0:${PORT}/?type=lobby`);
-  if (DEV_MODE) console.log(`[DEV] Dev mode ON`);
 });
 
 process.on("SIGTERM", () => {
@@ -324,4 +305,3 @@ process.on("SIGTERM", () => {
   if (clientGoTimer) clearTimeout(clientGoTimer);
   wss.close();
 });
-
