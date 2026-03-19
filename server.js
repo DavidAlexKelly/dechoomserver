@@ -198,6 +198,10 @@ wss.on("connection", (ws, req) => {
       if (lobbyClients.length < MIN_PLAYERS) return;
       matchInProgress = true;
 
+      // Close and remove all stale binary connections from previous matches.
+      // These must be fully gone before the host opens its listening socket,
+      // otherwise stale clients consume UIDs and break the uid=1 assumption
+      // that all clients use with -connect 1.
       for (const [staleUid, staleWs] of binaryClients) {
         console.log(`[BINARY] Clearing stale binary client uid=${staleUid} before match start`);
         try { staleWs.close(1000, "match starting"); } catch {}
@@ -224,13 +228,15 @@ wss.on("connection", (ws, req) => {
         }, i * 200);
       });
 
-      // Step 2: Send "go" to host — it starts Doom and waits for clients
+      // Step 2: Send "go" to host after a delay long enough for stale binary
+      // WebSocket connections to fully close on Render's infrastructure.
+      // 500ms was too short — stale sockets were still open and consuming
+      // uid=1 when the host connected, breaking all client routing.
       setTimeout(() => {
-        if (lobbyClients[0]?.ws.readyState === WebSocket.OPEN) {
-          console.log(`[LOBBY] Sending go to host`);
-          lobbyClients[0].ws.send(JSON.stringify({ type: "go" }));
-        }
-      }, 500);
+        if (lobbyClients[0]?.ws.readyState !== WebSocket.OPEN) return;
+        console.log(`[LOBBY] Sending go to host`);
+        lobbyClients[0].ws.send(JSON.stringify({ type: "go" }));
+      }, 1500);
 
       // Step 3: After host headstart, tell all clients to connect simultaneously.
       // All client_go messages are sent at the same time so clients race to
@@ -244,7 +250,7 @@ wss.on("connection", (ws, req) => {
           c.ws.send(JSON.stringify({ type: "client_go", playerIndex: i + 1 }));
         });
         startMatchTimer();
-      }, 500 + HOST_HEADSTART_MS);
+      }, 1500 + HOST_HEADSTART_MS);
       // ─────────────────────────────────────────────────────────────────────
 
     } else if (msg.type === "client_ready") {
