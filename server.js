@@ -21,7 +21,7 @@ const MAX_PLAYERS = 8;
 
 // How long the host Doom gets to start and open its listening socket
 // before clients are told to connect.
-const HOST_HEADSTART_MS = 4000;
+const HOST_HEADSTART_MS = 7000;
 
 const wss = new WebSocketServer({ port: PORT });
 
@@ -232,15 +232,16 @@ wss.on("connection", (ws, req) => {
         }
       }, 500);
 
-      // Step 3: After host headstart, tell clients to connect
+      // Step 3: After host headstart, tell all clients to connect simultaneously.
+      // All client_go messages are sent at the same time so clients race to
+      // connect together — staggering them caused consistency failures with 3+
+      // players because Doom's first tic ran before the last client connected.
       clientGoTimer = setTimeout(() => {
         clientGoTimer = null;
         lobbyClients.slice(1).forEach((c, i) => {
-          setTimeout(() => {
-            if (c.ws.readyState !== WebSocket.OPEN) return;
-            console.log(`[LOBBY] Sending client_go to ${c.username}`);
-            c.ws.send(JSON.stringify({ type: "client_go" }));
-          }, i * 300);
+          if (c.ws.readyState !== WebSocket.OPEN) return;
+          console.log(`[LOBBY] Sending client_go to ${c.username} (playerIndex ${i + 1})`);
+          c.ws.send(JSON.stringify({ type: "client_go", playerIndex: i + 1 }));
         });
         startMatchTimer();
       }, 500 + HOST_HEADSTART_MS);
